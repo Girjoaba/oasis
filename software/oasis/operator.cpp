@@ -38,12 +38,12 @@ void LocalSourceOperator::print(std::ostream &os) const {
 
 void DecodeColumnChunkOperator::apply(libstf::stream_t stream, OasisContext &ctx) {
     auto config = ctx.config<parcore::ColumnChunkDecoderConfig>();
-    config->enqueue_column_chunk(stream, compression_, num_values_, type_);
+    config->enqueue_column_chunk(stream, compression_, num_values_, type_, is_required_);
 }
 
 void DecodeColumnChunkOperator::print(std::ostream &os) const {
     os << "DecodeColumnChunk(compression=" << compression_ << ", num_values=" << num_values_
-       << ", type=" << type_ << ")";
+       << ", type=" << type_ << ", is_required=" << is_required_ << ")";
 }
 
 void LocalSinkOperator::apply(libstf::stream_t stream, OasisContext &ctx) {
