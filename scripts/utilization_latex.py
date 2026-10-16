@@ -23,6 +23,17 @@ COMPONENTS = [
     ("Stream normalizer", "inst_normalize_until_out"),
 ]
 
+# Shell instances that make up the RDMA stack, from the CMAC (inside
+# inst_network_top) to the per-destination stream buffers in the user wrapper
+# (remote credit/response queues)
+RDMA_RE = "|".join((
+    r"inst_network_top",
+    r"(genblk\d+\[\d+\]\.)?inst_rdma_slice_array_\d+",
+    r"inst_remote_credits_rd",
+    r"inst_remote_credits_wr_rdma",
+    r"inst_remote_resp_rd",
+))
+
 METRICS = ["luts", "ffs", "bram36", "uram", "dsp"]
 HEADERS = {"luts": "LUTs", "ffs": "Registers", "bram36": "BRAM", "uram": "URAM", "dsp": "DSPs"}
 
@@ -68,10 +79,10 @@ def add(acc, res):
 
 
 def fmt_count(v):
-    """720400 -> 720.4K, 62080 -> 62.08K, 6346 -> 6346 (4 significant digits)."""
+    """720400 -> 720K, 62080 -> 62.1K, 6346 -> 6346 (3 significant digits)."""
     if v >= 10_000:
         k = v / 1000
-        return f"{k:.0f}K" if k >= 1000 else f"{k:.1f}K" if k >= 100 else f"{k:.2f}K"
+        return f"{k:.0f}K" if k >= 100 else f"{k:.1f}K"
     return str(int(v + 0.5))
 
 
@@ -98,6 +109,7 @@ def main():
 
     chip = dict.fromkeys(METRICS, 0.0)
     total = dict.fromkeys(METRICS, 0.0)
+    rdma = dict.fromkeys(METRICS, 0.0)
     decoders = dict.fromkeys(METRICS, 0.0)
     comps = {label: dict.fromkeys(METRICS, 0.0) for label, _ in COMPONENTS}
     n_decoders = 0
@@ -107,6 +119,8 @@ def main():
             add(chip, res)
         elif instance == "inst_user_c0_0":
             add(total, res)
+        elif re.fullmatch(RDMA_RE, instance):
+            add(rdma, res)
         elif re.fullmatch(r"gen_decoders\[\d+\]\.inst_column_chunk_decoder", instance):
             n_decoders += 1
             add(decoders, res)
@@ -132,7 +146,7 @@ def main():
 
     print(f"% Generated from {path} (percentages relative to xcu55c device totals)")
     print("\\begin{table}[t]")
-    print("\\caption{Resource utilization on one Alveo U55C FPGA.}")
+    print("\\caption{Resource utilization of the Oasis SmartNIC (4 hardware decoders) on one Alveo U55C FPGA.}")
     print("\\label{tab:resource_utilization}")
     print("\\centering")
     print("\\footnotesize")
@@ -141,12 +155,14 @@ def main():
     print(" Component & " + " & ".join(HEADERS[m] for m in metrics) + " \\\\")
     print(" \\hline")
     print(" \\hline")
-    print(fmt_row(f"Column chunk decoders ({n_decoders}x)", decoders, metrics))
+    print(fmt_row(f"Col. chunk decoder ({n_decoders}x)", decoders, metrics))
     for label, _ in COMPONENTS:
         print(fmt_row(label, comps[label], metrics, indent=True))
     print(fmt_row("Other", other_dec, metrics, indent=True))
-    print(fmt_row("Other (I/O, infrastructure)", other_top, metrics))
+    print(fmt_row("Other (Config, I/O, ...)", other_top, metrics))
+    print(" \\hline")
     print(fmt_row("Coyote shell", coyote, metrics))
+    print(fmt_row("RDMA stack", rdma, metrics, indent=True))
     print(" \\hline")
     print(fmt_row("Overall", chip, metrics))
     print("\\end{tabular}")
