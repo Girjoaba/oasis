@@ -78,6 +78,8 @@ static LogicalType HardwareOutputType(libstf::type_t type) {
 	switch (type) {
 	case libstf::type_t::BYTE_T:
 		return LogicalType::BOOLEAN;
+	case libstf::type_t::INT16_T:
+		return LogicalType::SMALLINT;
 	case libstf::type_t::INT32_T:
 		return LogicalType::INTEGER;
 	case libstf::type_t::INT64_T:
@@ -121,26 +123,20 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 			gstate->emit_cardinality_only = true;
 			continue;
 		}
-		auto t = bind_data.metadata.groups[0].chunks[col_id].type;
-		if (parcore::metadata::is_libstf_type(t)) {
-			// Hardware path: Fixed-width type the ParCore decoder handles.
-			ProjectedColumn col {col_id, libstf::size_of(parcore::metadata::to_libstf_type(t)), false};
-			// The decoded buffer is referenced zero-copy as the table column's vector, so the
-			// hardware's element width must equal the DuckDB type's. Parquet logical types that
-			// narrow the physical type (INT_8/INT_16/UINT_8/UINT_16 on INT32, TIME_MILLIS on INT32)
-			// would need a converting copy; reject them until that is supported rather than
-			// reinterpreting the bytes as the narrower type.
+		const auto &chunk = bind_data.metadata.groups[0].chunks[col_id];
+		if (parcore::metadata::is_libstf_type(chunk.type)) {
+			const auto logical_type = chunk.logical_type();
 			const auto &column_type = bind_data.column_types[col_id];
-			if (GetTypeIdSize(column_type.InternalType()) != col.elem_size) {
+			const auto duckdb_size = GetTypeIdSize(column_type.InternalType());
+			if (libstf::size_of(logical_type) != duckdb_size) {
 				throw NotImplementedException(
 				    "read_oasis: column '%s' has DuckDB type %s (%llu bytes) but is decoded in hardware as %s "
-				    "(%llu bytes). Rewrite the file with the column cast to the physical width (e.g. INTEGER).",
+				    "(%llu bytes).",
 				    bind_data.metadata.column_names[col_id].c_str(), column_type.ToString().c_str(),
-				    (unsigned long long)GetTypeIdSize(column_type.InternalType()),
-				    HardwareOutputType(parcore::metadata::to_libstf_type(t)).ToString().c_str(),
-				    (unsigned long long)col.elem_size);
+				    (unsigned long long)duckdb_size, HardwareOutputType(logical_type).ToString().c_str(),
+				    (unsigned long long)libstf::size_of(logical_type));
 			}
-			gstate->projected_columns.push_back(std::move(col));
+			gstate->projected_columns.push_back({col_id, duckdb_size, false});
 		} else {
 			// CPU path: Variable-length type (BYTE_ARRAY/string) decoded by DuckDB's ColumnReader.
 			gstate->projected_columns.push_back({col_id, 0, true});
@@ -352,6 +348,7 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	for (size_t k = 0; k < pending.hw_slot.size(); k++) {
 		const auto &cc = *pending.hw_chunks[k];
 		auto type = parcore::metadata::to_libstf_type(cc.type);
+		auto logical_type = cc.logical_type();
 
 		oasis::OperatorFlow flow;
 		if (rdma) {
@@ -359,9 +356,9 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 		} else {
 			flow.push_back(MakeHostSource(pending.fetcher->Resolve(pending.host_handles[k])));
 		}
-		flow.push_back(
-		    std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type, cc.is_required));
-		auto sink_buffer = ctx.allocate_output_buffer(cc.num_values * libstf::size_of(type));
+		flow.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type,
+		                                                                   cc.is_required, logical_type));
+		auto sink_buffer = ctx.allocate_output_buffer(cc.num_values * libstf::size_of(logical_type));
 		flow.push_back(std::make_unique<oasis::LocalSinkOperator>(std::move(sink_buffer), pending.hw_slot[k]));
 		splinter.streams.push_back(std::move(flow));
 	}

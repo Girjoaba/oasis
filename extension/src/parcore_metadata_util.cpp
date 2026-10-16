@@ -35,10 +35,38 @@ static parcore::metadata::Compression parquet_codec_to_parcore(duckdb_parquet::C
 	}
 }
 
-// Appends the max definition level of every leaf below schema[idx] in depth-first order, which is
-// the order of the column chunks in a row group. Returns the index after the subtree.
-static idx_t CollectLeafMaxDefine(const vector<duckdb_parquet::SchemaElement> &schema, idx_t idx,
-                                  idx_t parent_max_define, vector<idx_t> &leaf_max_define) {
+static uint8_t LogicalWidth(const duckdb_parquet::SchemaElement &element) {
+	if (element.__isset.logicalType && element.logicalType.__isset.INTEGER) {
+		return static_cast<uint8_t>(element.logicalType.INTEGER.bitWidth);
+	}
+	if (!element.__isset.converted_type) {
+		return 0;
+	}
+	switch (element.converted_type) {
+	case duckdb_parquet::ConvertedType::INT_8:
+	case duckdb_parquet::ConvertedType::UINT_8:
+		return 8;
+	case duckdb_parquet::ConvertedType::INT_16:
+	case duckdb_parquet::ConvertedType::UINT_16:
+		return 16;
+	case duckdb_parquet::ConvertedType::INT_32:
+	case duckdb_parquet::ConvertedType::UINT_32:
+		return 32;
+	case duckdb_parquet::ConvertedType::INT_64:
+	case duckdb_parquet::ConvertedType::UINT_64:
+		return 64;
+	default:
+		return 0;
+	}
+}
+
+struct LeafInfo {
+	idx_t max_define;
+	uint8_t logical_width;
+};
+
+static idx_t CollectLeaves(const vector<duckdb_parquet::SchemaElement> &schema, idx_t idx, idx_t parent_max_define,
+                           vector<LeafInfo> &leaves) {
 	if (idx >= schema.size()) {
 		throw InvalidInputException("Malformed Parquet schema: child index %llu out of bounds", (unsigned long long)idx);
 	}
@@ -50,11 +78,11 @@ static idx_t CollectLeafMaxDefine(const vector<duckdb_parquet::SchemaElement> &s
 
 	idx = idx + 1;
 	if (!element.__isset.num_children || element.num_children == 0) {
-		leaf_max_define.push_back(max_define);
+		leaves.push_back({max_define, LogicalWidth(element)});
 		return idx;
 	}
 	for (int32_t i = 0; i < element.num_children; i++) {
-		idx = CollectLeafMaxDefine(schema, idx, max_define, leaf_max_define);
+		idx = CollectLeaves(schema, idx, max_define, leaves);
 	}
 	return idx;
 }
@@ -65,11 +93,11 @@ parcore::metadata::Metadata BuildParcoreMetadata(ParquetReader &parquet_reader) 
 	parcore::metadata::Metadata meta;
 
 	// schema[0] is the root; its own repetition (if any) does not contribute definition levels.
-	vector<idx_t> leaf_max_define;
+	vector<LeafInfo> leaves;
 	if (!file_meta->schema.empty()) {
 		auto &root = file_meta->schema[0];
 		for (idx_t idx = 1, child = 0; child < static_cast<idx_t>(root.num_children); child++) {
-			idx = CollectLeafMaxDefine(file_meta->schema, idx, 0, leaf_max_define);
+			idx = CollectLeaves(file_meta->schema, idx, 0, leaves);
 		}
 	}
 
@@ -80,10 +108,9 @@ parcore::metadata::Metadata BuildParcoreMetadata(ParquetReader &parquet_reader) 
 	for (auto &rg : file_meta->row_groups) {
 		parcore::metadata::RowGroup parcore_rg;
 
-		if (rg.columns.size() != leaf_max_define.size()) {
+		if (rg.columns.size() != leaves.size()) {
 			throw InvalidInputException("Parquet row group has %llu column chunks but the schema has %llu leaf columns",
-			                            (unsigned long long)rg.columns.size(),
-			                            (unsigned long long)leaf_max_define.size());
+			                            (unsigned long long)rg.columns.size(), (unsigned long long)leaves.size());
 		}
 
 		for (idx_t col_idx = 0; col_idx < rg.columns.size(); col_idx++) {
@@ -98,7 +125,8 @@ parcore::metadata::Metadata BuildParcoreMetadata(ParquetReader &parquet_reader) 
 			parcore_cc.total_compressed_size = static_cast<uint64_t>(cmd.total_compressed_size);
 			// The max definition level covers the whole path, so a REQUIRED leaf below an OPTIONAL group has
 			// definition levels and is not is_required.
-			parcore_cc.is_required = leaf_max_define[col_idx] == 0;
+			parcore_cc.is_required = leaves[col_idx].max_define == 0;
+			parcore_cc.logical_width = leaves[col_idx].logical_width;
 
 			parcore_rg.chunks.push_back(std::move(parcore_cc));
 		}
