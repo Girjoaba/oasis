@@ -34,9 +34,8 @@ c_double	DOUBLE
 # ---------------------------------------------------------------------------
 # Row counts
 #
-# COUNT(*) with no filter consumes no column values, so the optimizer projects the zero-width
-# virtual column and the scan takes the EmitCardinalityOnly path -- row counts come from the
-# footer without any decoding.
+# COUNT(*) with no filter consumes no column values, so DuckDB answers it from the row counts in
+# the footer (get_partition_stats) without scanning.
 # ---------------------------------------------------------------------------
 
 query IIIIIIII
@@ -53,7 +52,7 @@ SELECT
 1000	1000	1000	1000	1000	1000	65536	10000
 
 # The same counts must come out of the decoding path, not just the footer. Referencing a column
-# in the aggregate keeps the optimizer from projecting the virtual column away.
+# in the aggregate keeps DuckDB from answering it from the footer.
 query IIII
 SELECT
     (SELECT count(a) FROM read_oasis('data/int32.parquet')),
@@ -62,6 +61,15 @@ SELECT
     (SELECT count(col0) FROM read_oasis('data/test.parquet'));
 ----
 1000	1000	65536	10000
+
+# A query that uses no column but is not a plain COUNT(*) still scans. DuckDB then reads the first
+# column to count the rows.
+query II
+SELECT
+    (SELECT sum(1) FROM read_oasis('data/mixed_small.parquet')),
+    (SELECT count(*) FROM (SELECT 1 FROM read_oasis('data/test.parquet') LIMIT 5000));
+----
+65536	5000
 
 # ---------------------------------------------------------------------------
 # Value correctness, checked against the structure the fixtures were generated with

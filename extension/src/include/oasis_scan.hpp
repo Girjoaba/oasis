@@ -63,6 +63,9 @@ struct OasisScanBindData : public TableFunctionData {
 	string filename;
 	parcore::metadata::Metadata metadata;
 	shared_ptr<ParquetFileMetadataCache> parquet_metadata;
+	// Reader over parquet_metadata that does not open the file. It answers statistics questions at
+	// plan time, and must outlive the partition statistics it hands out (they reference it).
+	shared_ptr<ParquetReader> metadata_reader;
 };
 
 struct ProjectedColumn {
@@ -89,9 +92,6 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	vector<column_t> projection_ids;
 	bool can_prune = false;
 	std::vector<bool> column_emitted;
-
-	// True when the query consumes no column values (e.g. COUNT(*), EXISTS).
-	bool emit_cardinality_only = false;
 
 	optional_ptr<TableFilterSet> filters;
 
@@ -196,11 +196,6 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 	size_t current_buf_offset = 0;
 	size_t current_group_num_rows = 0;
 	idx_t current_group = 0;
-
-	// Empty-projection path only (COUNT(*) etc.): Rows left to emit from the row group we last
-	// claimed. We never decode anything in this path -- the count comes straight from the Parquet
-	// metadata.
-	size_t empty_proj_remaining = 0;
 
 	// This worker's profiling counters (steady_clock nanoseconds), folded into the global totals
 	// when the worker's scan finishes.

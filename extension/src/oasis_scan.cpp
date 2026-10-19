@@ -5,8 +5,10 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/multi_file/multi_file_options.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
+#include "duckdb/function/partition_stats.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/profiler/profiling_node.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "oasis/oasis_context.hpp"
@@ -47,7 +49,7 @@ private:
 } // namespace
 
 unique_ptr<FunctionData> OasisScanBind(ClientContext &context, TableFunctionBindInput &input,
-                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto parquet_file = StringValue::Get(input.inputs[0]);
 
 	ParquetOptions parquet_opts(context);
@@ -56,7 +58,7 @@ unique_ptr<FunctionData> OasisScanBind(ClientContext &context, TableFunctionBind
 	auto bind_data = make_uniq<OasisScanBindData>();
 
 	for (auto &col : parquet_reader.columns) {
-		names.push_back(col.name.GetIdentifierName());
+		names.push_back(col.name);
 		return_types.push_back(col.type);
 		bind_data->column_types.push_back(col.type);
 	}
@@ -69,6 +71,7 @@ unique_ptr<FunctionData> OasisScanBind(ClientContext &context, TableFunctionBind
 	bind_data->filename = parquet_file;
 
 	bind_data->parquet_metadata = parquet_reader.metadata;
+	bind_data->metadata_reader = ParquetReader::CreateMetadataReader(context, parquet_opts, parquet_reader.metadata);
 
 	return std::move(bind_data);
 }
@@ -119,10 +122,6 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	gstate->yield_enabled = yield_val.IsNull() || yield_val.GetValue<bool>();
 
 	for (auto col_id : input.column_ids) {
-		if (col_id == COLUMN_IDENTIFIER_EMPTY) {
-			gstate->emit_cardinality_only = true;
-			continue;
-		}
 		const auto &chunk = bind_data.metadata.groups[0].chunks[col_id];
 		if (parcore::metadata::is_libstf_type(chunk.type)) {
 			const auto logical_type = chunk.logical_type();
@@ -156,14 +155,13 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 		}
 	}
 
-	// Register a cold-start yield budget for hardware scans -- roughly one yield per prospective
-	// worker, so during cold start workers step aside to let others prime the pipeline breadth-first.
-	// The cardinality-only path never touches the hardware, so it registers nothing. DuckDB clamps
-	// this scan's parallelism to min(MaxThreads(), scheduler threads), and MaxThreads() is
-	// total_groups; INITIALIZE_ON_SCHEDULE runs this eagerly at schedule time so we know that count
-	// before any worker executes. Budget is consumed only by yields that actually happen, so any
-	// unused remainder is harmless -- no reconciliation needed.
-	if (!gstate->emit_cardinality_only && gstate->yield_enabled && !gstate->synchronous) {
+	// Register a cold-start yield budget -- roughly one yield per prospective worker, so during cold
+	// start workers step aside to let others prime the pipeline breadth-first. DuckDB clamps this
+	// scan's parallelism to min(MaxThreads(), scheduler threads), and MaxThreads() is total_groups.
+	// INITIALIZE_ON_SCHEDULE runs this eagerly at schedule time, so we know that count before any
+	// worker executes. Budget is consumed only by yields that actually happen, so any unused
+	// remainder is harmless -- no reconciliation needed.
+	if (gstate->yield_enabled && !gstate->synchronous) {
 		size_t const num_threads =
 		    std::max<size_t>(1, static_cast<size_t>(TaskScheduler::GetScheduler(context).NumberOfThreads()));
 		size_t const yield_budget = std::max<size_t>(1, std::min<size_t>(gstate->total_groups, num_threads));
@@ -216,12 +214,9 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
 	}
 	lstate->scan_state = make_uniq<ParquetReaderScanState>();
 
-	vector<idx_t> groups_to_read;
-	groups_to_read.reserve(gstate.total_groups);
-	for (idx_t g = 0; g < gstate.total_groups; g++) {
-		groups_to_read.push_back(g);
-	}
-	lstate->parquet_reader->InitializeScan(context.client, *lstate->scan_state, std::move(groups_to_read));
+	// Creates the per-column readers, which the row-group statistics use. InitGroupCPUColumns
+	// re-initializes the scan state for every group it decodes on the CPU.
+	lstate->parquet_reader->InitializeScan(context.client, *lstate->scan_state, 0);
 
 	// Full-width staging chunk for filter pruning: Slices are scanned and filtered here, and only
 	// the projection_ids columns are referenced into the (narrower) output chunk.
@@ -418,7 +413,7 @@ static void InitGroupCPUColumns(ClientContext &context, OasisScanGlobalState &gs
 	// can leave a group mid-page with skips still pending (rejected or filter-only column tails).
 	// Discarding the readers with the group makes those leftovers harmless -- and the skipped tail
 	// pages are never touched at all. The file handle (and any RDMA-staged ranges) is kept.
-	lstate.parquet_reader->InitializeScan(context, *lstate.scan_state, {});
+	lstate.parquet_reader->InitializeScan(context, *lstate.scan_state, group);
 	const auto &row_group_columns = lstate.parquet_reader->GetFileMetadata()->row_groups[group].columns;
 	auto &trans = reinterpret_cast<ThriftFileTransport &>(*lstate.scan_state->thrift_file_proto->getTransport());
 	trans.ClearPrefetch();
@@ -429,11 +424,12 @@ static void InitGroupCPUColumns(ClientContext &context, OasisScanGlobalState &gs
 	// round trip on this worker thread, on the bypass stream, while the decoders are busy with
 	// the next group. On the local path merging still pays off (fewer file reads).
 	const bool rdma_path =
-	    dynamic_cast<RDMAFileHandle *>(&lstate.scan_state->file_handle->GetFileHandle()) != nullptr;
+	    dynamic_cast<RDMAFileHandle *>(lstate.scan_state->file_handle->GetFileHandle().get()) != nullptr;
 	for (const auto &col : gstate.projected_columns) {
 		if (col.is_cpu) {
 			auto &reader = lstate.scan_state->GetColumnReader(col.column_id);
-			reader.InitializeRead(group, row_group_columns, *lstate.scan_state->thrift_file_proto);
+			reader.InitializeRead(group, lstate.parquet_reader->GetFileMetadata()->row_groups[group].num_rows,
+			                      row_group_columns, *lstate.scan_state->thrift_file_proto);
 			reader.RegisterPrefetch(trans, /*allow_merge=*/!rdma_path);
 		}
 	}
@@ -573,7 +569,7 @@ static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx,
 	// (releasing those buffers once the transport no longer references their bytes).
 	if (!head.cpu_slot.empty()) {
 		D_ASSERT(lstate.scan_state->file_handle);
-		auto *rdma = dynamic_cast<RDMAFileHandle *>(&lstate.scan_state->file_handle->GetFileHandle());
+		auto *rdma = dynamic_cast<RDMAFileHandle *>(lstate.scan_state->file_handle->GetFileHandle().get());
 		D_ASSERT(rdma); // cpu_slot is only populated on the RDMA path
 		std::vector<RDMAFileHandle::StagedRange> ranges;
 		ranges.reserve(head.cpu_slot.size());
@@ -590,34 +586,6 @@ static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx,
 	InitGroupCPUColumns(context, gstate, lstate, head.group);
 	lstate.inflight.pop_front();
 	return LoadResult::LOADED;
-}
-
-// Emits cardinality only, for queries that project no columns (COUNT(*), EXISTS, etc.). DuckDB
-// derives the aggregate from the row counts we report, so there is nothing to decode: each worker
-// claims row groups off the shared cursor and emits their row counts (from the Parquet metadata)
-// in STANDARD_VECTOR_SIZE slices. The hardware is never touched.
-//
-// This path only runs when the query has no filter. A filtered aggregate (e.g.
-// SELECT COUNT(*) ... WHERE x > 5) still references the filter column, so DuckDB projects it and
-// emit_cardinality_only stays false -- such queries go through OasisScanFunction's normal decode
-// path, where DecodeAndFilterSlice drops the non-matching rows. So here gstate.filters is always
-// null and there is nothing to prune; we only skip empty row groups.
-static void EmitCardinalityOnly(OasisScanGlobalState &gstate, OasisScanLocalState &lstate,
-                                const OasisScanBindData &bind, DataChunk &output) {
-	// Claim the next non-empty group off the shared cursor, or signal EOF once the groups run out.
-	if (lstate.empty_proj_remaining == 0) {
-		size_t group = ClaimNextNonEmptyGroup(gstate, bind);
-		if (group >= gstate.total_groups) {
-			output.SetChildCardinality(0);
-			return;
-		}
-		lstate.empty_proj_remaining = RowGroupNumRows(bind, group);
-		lstate.current_group = group;
-	}
-
-	size_t const emit = std::min<size_t>(lstate.empty_proj_remaining, STANDARD_VECTOR_SIZE);
-	lstate.empty_proj_remaining -= emit;
-	output.SetChildCardinality(emit);
 }
 
 struct SliceResult {
@@ -731,11 +699,6 @@ void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataC
 	auto &bind = data_p.bind_data->Cast<OasisScanBindData>();
 	auto &ctx = *gstate.ctx;
 
-	if (gstate.emit_cardinality_only) {
-		EmitCardinalityOnly(gstate, lstate, bind, output);
-		return;
-	}
-
 	while (true) {
 		output.Reset();
 		std::vector<unique_ptr<AsyncTask>> tasks;
@@ -771,9 +734,17 @@ unique_ptr<BaseStatistics> OasisScanStatistics(ClientContext &context, const Fun
 	if (column_index >= bind.metadata.column_names.size()) {
 		return nullptr;
 	}
-	ParquetOptions parquet_opts(context);
-	ParquetReader reader(context, OpenFileInfo {bind.filename}, parquet_opts);
-	return reader.GetStatistics(context, Identifier(bind.metadata.column_names[column_index]));
+	return bind.metadata_reader->GetStatistics(context, Identifier(bind.metadata.column_names[column_index]));
+}
+
+// The row groups of the file with their statistics, as read_parquet reports them. DuckDB answers
+// e.g. COUNT(*), MIN and MAX from them without a scan, also when the filters keep or drop whole row
+// groups.
+static vector<PartitionStatistics> OasisScanGetPartitionStats(ClientContext &, GetPartitionStatsInput &input) {
+	vector<PartitionStatistics> result;
+	auto &bind = input.bind_data->Cast<OasisScanBindData>();
+	bind.metadata_reader->GetPartitionStats(result);
+	return result;
 }
 
 double OasisScanProgress(ClientContext &, const FunctionData *, const GlobalTableFunctionState *global_state) {
@@ -825,15 +796,6 @@ static bool OasisScanPushdownExpression(ClientContext &, const LogicalGet &, Exp
 	return true;
 }
 
-// Advertises the zero-width COLUMN_IDENTIFIER_EMPTY virtual column. For queries that consume no
-// column values (e.g., COUNT(*), EXISTS), DuckDB's optimizer projects this sentinel instead of
-// anchoring the scan on a real column (LogicalGet::GetAnyColumn).
-virtual_column_map_t OasisScanGetVirtualColumns(ClientContext &, optional_ptr<FunctionData>) {
-	virtual_column_map_t result;
-	result.insert(make_pair(COLUMN_IDENTIFIER_EMPTY, TableColumn("", LogicalType::BOOLEAN)));
-	return result;
-}
-
 void RegisterOasisScanFunction(ExtensionLoader &loader) {
 	TableFunction table_function("read_oasis",           // Function name
 	                             {LogicalType::VARCHAR}, // Function arguments: Parquet file path
@@ -848,9 +810,9 @@ void RegisterOasisScanFunction(ExtensionLoader &loader) {
 	table_function.pushdown_expression = OasisScanPushdownExpression;
 	// Initialize the global state eagerly at schedule time to register our cold workers.
 	table_function.global_initialization = TableFunctionInitialization::INITIALIZE_ON_SCHEDULE;
-	table_function.get_virtual_columns = OasisScanGetVirtualColumns;
 	table_function.cardinality = OasisScanCardinality;
 	table_function.statistics = OasisScanStatistics;
+	table_function.get_partition_stats = OasisScanGetPartitionStats;
 	table_function.table_scan_progress = OasisScanProgress;
 	table_function.get_partition_data = OasisScanGetPartitionData;
 	table_function.get_metrics = OasisScanGetMetrics;

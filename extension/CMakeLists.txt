@@ -43,7 +43,10 @@ build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
 target_link_libraries(${EXTENSION_NAME} Coyote libstf parcore oasis)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} Coyote libstf parcore oasis)
+# The scan uses the Parquet reader of DuckDB's parquet extension, which DuckDB does not export. The
+# static extension gets it from the DuckDB it is linked into. The loadable extension carries its own
+# copy, hidden like the copy of DuckDB it carries, so it loads into any DuckDB of the same version.
+target_link_libraries(${LOADABLE_EXTENSION_NAME} Coyote libstf parcore oasis parquet_extension)
 
 install(
     TARGETS ${EXTENSION_NAME}

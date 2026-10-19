@@ -158,10 +158,7 @@ idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &ls
 				continue;
 			}
 			auto &vec = scan_chunk.data[scan_filter.filter_idx];
-			UnifiedVectorFormat vdata;
-			vec.ToUnifiedFormat(vdata);
-			ColumnSegment::FilterSelection(sel, vec, vdata, scan_filter.filter, *scan_filter.filter_state, scan_count,
-			                               approved_tuple_count);
+			ColumnSegment::FilterSelection(sel, vec, *scan_filter.filter_state, scan_count, approved_tuple_count);
 		}
 	}
 

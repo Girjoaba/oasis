@@ -84,7 +84,7 @@ ProfileRow MakeBypassRow(uint64_t stream, const parcore::StreamProfile &p) {
 }
 
 struct OasisProfileBindData : public TableFunctionData {
-	vector<string> names;
+	vector<Identifier> names;
 	vector<LogicalType> types;
 };
 
@@ -99,7 +99,7 @@ struct OasisProfileGlobalState : public GlobalTableFunctionState {
 };
 
 // Column layout, kept in one place so bind and scan stay in sync.
-void DefineColumns(vector<string> &names, vector<LogicalType> &types) {
+void DefineColumns(vector<Identifier> &names, vector<LogicalType> &types) {
 	auto add = [&](const char *name, LogicalType type) {
 		names.emplace_back(name);
 		types.emplace_back(std::move(type));
@@ -126,7 +126,7 @@ void DefineColumns(vector<string> &names, vector<LogicalType> &types) {
 }
 
 unique_ptr<FunctionData> OasisProfileBind(ClientContext &context, TableFunctionBindInput &input,
-                                          vector<LogicalType> &return_types, vector<string> &names) {
+                                          vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<OasisProfileBindData>();
 	DefineColumns(names, return_types);
 	bind_data->names = names;

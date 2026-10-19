@@ -29,9 +29,12 @@ Needs `Coyote`, `libstf`, `parcore` and `oasis` installed where CMake can find t
 make
 ```
 
-produces `build/release/extension/oasis/oasis.duckdb_extension` plus a `duckdb` shell and a
-`unittest` runner with the extension linked in. Configure with `-DEN_SIMULATION=ON` to link the
-Coyote simulation library and run without an FPGA (needs `xsim` and `COYOTE_SIM_DIR`).
+produces `build/release/extension/oasis/oasis.duckdb_extension` plus a `duckdb` shell,
+`libduckdb.so` and a `unittest` runner with the extension linked in. The scan uses DuckDB's
+Parquet reader, which DuckDB does not export, so the loadable extension carries its own copy. It
+loads into any DuckDB built from the same commit as `duckdb/` (with `allow_unsigned_extensions`).
+Configure with `-DEN_SIMULATION=ON` to link the Coyote simulation library and run without an FPGA
+(needs `xsim` and `COYOTE_SIM_DIR`).
 
 ## Testing
 
