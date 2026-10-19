@@ -10,6 +10,9 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/profiler/profiling_node.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/storage/statistics/numeric_stats.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "oasis/oasis_context.hpp"
 #include "oasis/operator.hpp"
@@ -62,6 +65,7 @@ unique_ptr<FunctionData> OasisScanBind(ClientContext &context, TableFunctionBind
 		return_types.push_back(col.type);
 		bind_data->column_types.push_back(col.type);
 	}
+	bind_data->output_types = bind_data->column_types;
 
 	auto meta = BuildParcoreMetadata(parquet_reader);
 	if (meta.groups.empty()) {
@@ -96,6 +100,86 @@ static LogicalType HardwareOutputType(libstf::type_t type) {
 	}
 }
 
+// Hardware type of the integer types a pushed-down cast can narrow a column to. The decoders
+// narrow by truncation, which is correct for unsigned targets too when the values fit.
+static std::optional<libstf::type_t> CastHardwareType(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::UINTEGER:
+		return libstf::type_t::INT32_T;
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::USMALLINT:
+		return libstf::type_t::INT16_T;
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::UTINYINT:
+		return libstf::type_t::BYTE_T;
+	default:
+		return std::nullopt;
+	}
+}
+
+// DuckDB's TYPE_PUSHDOWN offers the cast of a column that the query only uses cast, e.g. the
+// BIGINT -> INTEGER casts of compressed join keys. We accept integer narrowing casts that the
+// decoders can do, when the file statistics prove that every value fits the target type: Then the
+// cast can neither fail nor change a value, so CAST and TRY_CAST are the same. The scan outputs
+// the narrow type and DuckDB drops the cast.
+static bool OasisScanPushdownCast(ClientContext &context, const TableFunctionProjectionExpressionInput &input) {
+	if (!BoundCastExpression::IsCast(input.expr)) {
+		return false;
+	}
+	Value pushdown_val;
+	context.TryGetCurrentSetting("oasis_cast_pushdown", pushdown_val);
+	if (pushdown_val.IsNull() || !pushdown_val.GetValue<bool>()) {
+		return false;
+	}
+
+	const auto &column_id = input.get.GetColumnIds()[input.column_index];
+	if (column_id.IsVirtualColumn() || column_id.IsPushdownExtract()) {
+		return false;
+	}
+	// A filter pushed into the scan is bound to the type of the column before the cast
+	if (input.get.table_filters.HasFilter(input.column_index)) {
+		return false;
+	}
+	auto &bind = input.get.bind_data->CastNoConst<OasisScanBindData>();
+	const idx_t col_id = column_id.GetPrimaryIndex();
+	if (col_id >= bind.column_types.size()) {
+		return false;
+	}
+
+	// Only plain signed integer columns, whose statistics are the stored values (unlike DECIMAL or
+	// temporal types), and only casts to a narrower signed or unsigned integer type.
+	const auto &source = bind.column_types[col_id];
+	const auto &target = input.expr.GetReturnType();
+	const auto cast_type = CastHardwareType(target);
+	if ((source.id() != LogicalTypeId::BIGINT && source.id() != LogicalTypeId::INTEGER &&
+	     source.id() != LogicalTypeId::SMALLINT) ||
+	    !cast_type || GetTypeIdSize(target.InternalType()) >= GetTypeIdSize(source.InternalType())) {
+		return false;
+	}
+	const auto &chunk = bind.metadata.groups[0].chunks[col_id];
+	if (!parcore::metadata::is_libstf_type(chunk.type)) {
+		return false;
+	}
+	if (!parcore::ColumnChunkDecoderConfig::supports_cast(parcore::metadata::to_libstf_type(chunk.type), *cast_type)) {
+		return false;
+	}
+
+	// The file statistics only have min/max if every row group has them
+	const auto &name = bind.metadata.column_names[col_id];
+	auto stats = bind.metadata_reader->GetStatistics(context, Identifier(name));
+	if (!stats || !NumericStats::HasMinMax(*stats) ||
+	    NumericStats::Min(*stats).GetValue<int64_t>() < Value::MinimumValue(target).GetValue<int64_t>() ||
+	    NumericStats::Max(*stats).GetValue<int64_t>() > Value::MaximumValue(target).GetValue<int64_t>()) {
+		return false;
+	}
+
+	bind.output_types[col_id] = target;
+	DUCKDB_LOG_DEBUG(context, "Pushed cast of column '%s' from %s to %s into read_oasis.", name.c_str(),
+	                 source.ToString().c_str(), target.ToString().c_str());
+	return true;
+}
+
 unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<OasisScanBindData>();
 	auto &ctx = GetOrCreateOasisContext(context);
@@ -121,11 +205,20 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	context.TryGetCurrentSetting("oasis_enable_yield", yield_val);
 	gstate->yield_enabled = yield_val.IsNull() || yield_val.GetValue<bool>();
 
+	Value narrow_val;
+	context.TryGetCurrentSetting("oasis_narrow_transfer", narrow_val);
+	gstate->narrow_transfer = !narrow_val.IsNull() && narrow_val.GetValue<bool>();
+
 	for (auto col_id : input.column_ids) {
 		const auto &chunk = bind_data.metadata.groups[0].chunks[col_id];
 		if (parcore::metadata::is_libstf_type(chunk.type)) {
-			const auto logical_type = chunk.logical_type();
-			const auto &column_type = bind_data.column_types[col_id];
+			const auto &column_type = bind_data.output_types[col_id];
+			// A cast pushed into the scan is done by the decoders
+			std::optional<libstf::type_t> cast_type;
+			if (column_type != bind_data.column_types[col_id]) {
+				cast_type = CastHardwareType(column_type);
+			}
+			const auto logical_type = cast_type.value_or(chunk.logical_type());
 			const auto duckdb_size = GetTypeIdSize(column_type.InternalType());
 			if (libstf::size_of(logical_type) != duckdb_size) {
 				throw NotImplementedException(
@@ -135,7 +228,13 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 				    (unsigned long long)duckdb_size, HardwareOutputType(logical_type).ToString().c_str(),
 				    (unsigned long long)libstf::size_of(logical_type));
 			}
-			gstate->projected_columns.push_back({col_id, duckdb_size, false});
+			// Only signed 64-bit values stored as they are are narrowed, so sign-extending the INT32
+			// restores them. Statistics of other types (e.g. TIMESTAMP_MS) are in converted units.
+			const bool narrowable =
+			    logical_type == libstf::type_t::INT64_T &&
+			    (column_type.id() == LogicalTypeId::BIGINT ||
+			     (column_type.id() == LogicalTypeId::DECIMAL && column_type.InternalType() == PhysicalType::INT64));
+			gstate->projected_columns.push_back({col_id, duckdb_size, false, narrowable, cast_type});
 		} else {
 			// CPU path: Variable-length type (BYTE_ARRAY/string) decoded by DuckDB's ColumnReader.
 			gstate->projected_columns.push_back({col_id, 0, true});
@@ -224,7 +323,7 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
 		vector<LogicalType> scan_types;
 		scan_types.reserve(gstate.projected_columns.size());
 		for (auto &col : gstate.projected_columns) {
-			scan_types.push_back(lstate->parquet_reader->columns[col.column_id].type);
+			scan_types.push_back(bind_data.output_types[col.column_id]);
 		}
 		lstate->all_columns.Initialize(context.client, scan_types);
 	}
@@ -232,10 +331,22 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
 	// Prepare the pushed-down filters for row-level filtering (one TableFilterState per filter,
 	// owned by this worker), splitting top-level ANDs into per-conjunct filters (BuildScanFilters).
 	if (gstate.filters) {
-		BuildScanFilters(context.client, *gstate.filters, lstate->scan_filters);
+		BuildScanFilters(context.client, *gstate.filters, gstate, bind_data, lstate->scan_filters);
 	}
 
 	return std::move(lstate);
+}
+
+// Whether the chunk of the column in the group can be transferred as INT32: its statistics exist and
+// both bounds fit.
+static bool ChunkFitsInt32(OasisScanLocalState &lstate, size_t group, size_t column_id) {
+	const auto &pq_columns = lstate.parquet_reader->GetFileMetadata()->row_groups[group].columns;
+	auto stats = lstate.scan_state->GetColumnReader(column_id).Stats(group, pq_columns);
+	if (!stats || !NumericStats::HasMinMax(*stats)) {
+		return false;
+	}
+	return NumericStats::GetMin<int64_t>(*stats) >= NumericLimits<int32_t>::Minimum() &&
+	       NumericStats::GetMax<int64_t>(*stats) <= NumericLimits<int32_t>::Maximum();
 }
 
 static std::unique_ptr<oasis::SourceOperator> MakeRDMASource(RDMAFileHandle &rdma,
@@ -277,6 +388,7 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	// chunks whose bytes the splinter fetches over the bypass stream.
 	pending.hw_slot.reserve(gstate.projected_columns.size());
 	pending.hw_chunks.reserve(gstate.projected_columns.size());
+	pending.narrowed.assign(gstate.projected_columns.size(), false);
 	for (size_t i = 0; i < gstate.projected_columns.size(); i++) {
 		const auto &col = gstate.projected_columns[i];
 		if (col.is_cpu) {
@@ -289,9 +401,11 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 
 		const auto &cc = bind.metadata.groups[group].chunks[col.column_id];
 
+		pending.narrowed[i] = gstate.narrow_transfer && col.narrowable && ChunkFitsInt32(lstate, group, col.column_id);
+
 		// Enforce the one-buffer-per-chunk invariant: the decoded output must fit in a single FPGA
-		// output buffer. num_values is the row count, col.elem_size the decoded element width.
-		const size_t decoded_size = cc.num_values * col.elem_size;
+		// output buffer. num_values is the row count, the element width is the transfer width.
+		const size_t decoded_size = cc.num_values * (pending.narrowed[i] ? sizeof(int32_t) : col.elem_size);
 		if (decoded_size > libstf::MAXIMUM_OUTPUT_WRITER_BUFFER_SIZE) {
 			throw NotImplementedException(
 			    "Column '%s' row group %llu decodes to %llu bytes, exceeding the %llu byte maximum "
@@ -342,8 +456,10 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	splinter.streams.reserve(pending.hw_slot.size() + pending.cpu_slot.size());
 	for (size_t k = 0; k < pending.hw_slot.size(); k++) {
 		const auto &cc = *pending.hw_chunks[k];
+		const auto &col = gstate.projected_columns[pending.hw_slot[k]];
 		auto type = parcore::metadata::to_libstf_type(cc.type);
-		auto logical_type = cc.logical_type();
+		auto logical_type =
+		    pending.narrowed[pending.hw_slot[k]] ? libstf::type_t::INT32_T : col.cast_type.value_or(cc.logical_type());
 
 		oasis::OperatorFlow flow;
 		if (rdma) {
@@ -554,6 +670,7 @@ static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx,
 	}
 
 	lstate.current_buffers = std::move(head.hw_buffers);
+	lstate.current_narrowed = std::move(head.narrowed);
 	lstate.current_needs_row_filter = std::move(head.needs_row_filter);
 	lstate.current_buf_offset = 0;
 	lstate.current_group_num_rows = head.num_rows;
@@ -625,11 +742,27 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 		}
 
 		auto &buf = lstate.current_buffers[i];
-		if (buf->size / col.elem_size != total_elements) {
+		const bool narrowed = lstate.current_narrowed[i];
+		const size_t transfer_size = narrowed ? sizeof(int32_t) : col.elem_size;
+		if (buf->size / transfer_size != total_elements) {
 			throw InternalException(
 			    "ParCore buffer layout mismatch across columns: column %llu has %llu elements, expected %llu",
-			    (unsigned long long)i, (unsigned long long)(buf->size / col.elem_size),
+			    (unsigned long long)i, (unsigned long long)(buf->size / transfer_size),
 			    (unsigned long long)total_elements);
+		}
+
+		auto &vec = scan_chunk.data[i];
+		vec.SetVectorType(VectorType::FLAT_VECTOR);
+
+		// A chunk transferred as INT32 is sign-extended into the vector's own memory (the reset
+		// chunk's vectors own STANDARD_VECTOR_SIZE values again).
+		if (narrowed) {
+			auto src = reinterpret_cast<const int32_t *>(buf->ptr) + lstate.current_buf_offset;
+			auto dst = FlatVector::GetDataMutable<int64_t>(vec);
+			for (size_t r = 0; r < emit; r++) {
+				dst[r] = src[r];
+			}
+			continue;
 		}
 
 		// The actual zero-copy handoff. Two things happen here:
@@ -653,8 +786,6 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 		//     output.Reset()).
 		//   - vector auxiliary (set here) keeps it alive for any downstream
 		//     consumer that holds onto the vector past our next scan call.
-		auto &vec = scan_chunk.data[i];
-		vec.SetVectorType(VectorType::FLAT_VECTOR);
 		FlatVector::SetData(vec, reinterpret_cast<data_ptr_t>(buf->ptr) + lstate.current_buf_offset * col.elem_size,
 		                    count_t(emit));
 		vec.AddAuxiliaryData(make_uniq<LibstfBufferVectorBuffer>(buf));
@@ -731,7 +862,9 @@ unique_ptr<BaseStatistics> OasisScanStatistics(ClientContext &context, const Fun
 		return nullptr;
 	}
 	auto &bind = bind_data->Cast<OasisScanBindData>();
-	if (column_index >= bind.metadata.column_names.size()) {
+	// The file statistics have the file type, not the type of a cast pushed into the scan
+	if (column_index >= bind.metadata.column_names.size() ||
+	    bind.output_types[column_index] != bind.column_types[column_index]) {
 		return nullptr;
 	}
 	return bind.metadata_reader->GetStatistics(context, Identifier(bind.metadata.column_names[column_index]));
@@ -743,6 +876,10 @@ unique_ptr<BaseStatistics> OasisScanStatistics(ClientContext &context, const Fun
 static vector<PartitionStatistics> OasisScanGetPartitionStats(ClientContext &, GetPartitionStatsInput &input) {
 	vector<PartitionStatistics> result;
 	auto &bind = input.bind_data->Cast<OasisScanBindData>();
+	// The statistics have the file types, not the types of casts pushed into the scan
+	if (bind.output_types != bind.column_types) {
+		return result;
+	}
 	bind.metadata_reader->GetPartitionStats(result);
 	return result;
 }
@@ -808,6 +945,7 @@ void RegisterOasisScanFunction(ExtensionLoader &loader) {
 	table_function.filter_pushdown = true;
 	table_function.filter_prune = true;
 	table_function.pushdown_expression = OasisScanPushdownExpression;
+	table_function.projection_expression_pushdown = OasisScanPushdownCast;
 	// Initialize the global state eagerly at schedule time to register our cold workers.
 	table_function.global_initialization = TableFunctionInitialization::INITIALIZE_ON_SCHEDULE;
 	table_function.cardinality = OasisScanCardinality;

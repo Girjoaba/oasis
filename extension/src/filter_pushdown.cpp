@@ -2,6 +2,9 @@
 
 #include "column_reader.hpp"
 #include "duckdb/logging/log_manager.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/table/column_segment.hpp"
@@ -22,26 +25,101 @@ static void CollectConjuncts(const Expression &expr, vector<reference<const Expr
 	conjuncts.push_back(expr);
 }
 
-void BuildScanFilters(ClientContext &context, const TableFilterSet &filters,
-                      std::vector<OasisScanFilter> &scan_filters) {
+// The type of the column reference a filter was bound to.
+static LogicalType FilterInputType(const TableFilter &filter) {
+	LogicalType type;
+	ExpressionIterator::VisitExpression<BoundReferenceExpression>(
+	    *ExpressionFilter::GetExpressionFilter(filter, "FilterInputType").expr,
+	    [&](const BoundReferenceExpression &ref) { type = ref.GetReturnType(); });
+	return type;
+}
+
+// Rebinds `expr` to read the column as `scan_type`. Join filters read the column through the cast of
+// the join key, e.g. TRY_CAST(l_orderkey AS INTEGER), which is often the cast pushed into the scan.
+// An integer cast of the column becomes the same cast of the scan column: Its result only depends on
+// the value, which the narrowing kept because the file statistics proved that every value fits. A
+// cast to the scan type itself disappears. Any other use of the column reads it through an exact
+// widening cast.
+static void RebindExpression(ClientContext &context, unique_ptr<Expression> &expr, const LogicalType &scan_type,
+                             bool &rebound) {
+	if (BoundCastExpression::IsCast(*expr) && expr->GetReturnType().IsIntegral()) {
+		auto &cast = expr->Cast<BoundFunctionExpression>();
+		auto &child = BoundCastExpression::Child(cast);
+		if (child.GetExpressionClass() == ExpressionClass::BOUND_REF && child.GetReturnType() != scan_type) {
+			auto scan_ref =
+			    make_uniq<BoundReferenceExpression>(scan_type, child.Cast<BoundReferenceExpression>().Index());
+			expr = BoundCastExpression::AddCastToType(context, std::move(scan_ref), cast.GetReturnType(),
+			                                          BoundCastExpression::IsTryCast(cast));
+			rebound = true;
+			return;
+		}
+	}
+	if (expr->GetExpressionClass() == ExpressionClass::BOUND_REF) {
+		auto &ref = expr->Cast<BoundReferenceExpression>();
+		if (ref.GetReturnType() != scan_type) {
+			auto input_type = ref.GetReturnType();
+			auto scan_ref = make_uniq<BoundReferenceExpression>(scan_type, ref.Index());
+			expr = BoundCastExpression::AddCastToType(context, std::move(scan_ref), input_type);
+			rebound = true;
+		}
+		return;
+	}
+	ExpressionIterator::EnumerateChildren(
+	    *expr, [&](unique_ptr<Expression> &child) { RebindExpression(context, child, scan_type, rebound); });
+}
+
+// The filter rebound to read the column as `scan_type`, or null if it already does.
+static unique_ptr<TableFilter> RebindToScanType(ClientContext &context, const TableFilter &filter,
+                                                const LogicalType &scan_type) {
+	auto expr = ExpressionFilter::GetExpressionFilter(filter, "RebindToScanType").expr->Copy();
+	bool rebound = false;
+	RebindExpression(context, expr, scan_type, rebound);
+	return rebound ? make_uniq<ExpressionFilter>(std::move(expr)) : nullptr;
+}
+
+void BuildScanFilters(ClientContext &context, const TableFilterSet &filters, const OasisScanGlobalState &gstate,
+                      const OasisScanBindData &bind, std::vector<OasisScanFilter> &scan_filters) {
 	for (auto &entry : filters) {
+		// A cast pushed into the scan narrowed the column after its filters were bound
+		optional_ptr<const LogicalType> file_type, scan_type;
+		size_t const out_idx = entry.GetIndex();
+		if (out_idx < gstate.projected_columns.size()) {
+			size_t const col_id = gstate.projected_columns[out_idx].column_id;
+			if (bind.output_types[col_id] != bind.column_types[col_id]) {
+				file_type = &bind.column_types[col_id];
+				scan_type = &bind.output_types[col_id];
+			}
+		}
+		auto add = [&](const TableFilter &filter, unique_ptr<TableFilter> owned_filter) {
+			auto row_filter = scan_type ? RebindToScanType(context, filter, *scan_type) : nullptr;
+			if (owned_filter) {
+				scan_filters.emplace_back(context, out_idx, std::move(owned_filter), std::move(row_filter));
+			} else {
+				scan_filters.emplace_back(context, out_idx, filter, std::move(row_filter));
+			}
+			if (file_type) {
+				scan_filters.back().prune_on_stats = FilterInputType(scan_filters.back().filter) == *file_type;
+			}
+		};
+
 		auto &filter = entry.Filter();
 		if (filter.filter_type != TableFilterType::EXPRESSION_FILTER) {
-			scan_filters.emplace_back(context, entry.GetIndex(), filter);
+			add(filter, nullptr);
 			continue;
 		}
 		auto &expr = *filter.Cast<ExpressionFilter>().expr;
 		vector<reference<const Expression>> conjuncts;
 		CollectConjuncts(expr, conjuncts);
 		if (conjuncts.size() <= 1) {
-			scan_filters.emplace_back(context, entry.GetIndex(), filter);
+			add(filter, nullptr);
 			continue;
 		}
 		// Splitting an AND into sequentially applied filters is equivalent: Both intersect the
 		// passing rows, and a NULL conjunct fails the row either way.
 		for (auto &conjunct : conjuncts) {
-			scan_filters.emplace_back(context, entry.GetIndex(),
-			                          make_uniq<ExpressionFilter>(conjunct.get().Copy()));
+			auto owned_filter = make_uniq<ExpressionFilter>(conjunct.get().Copy());
+			auto &conjunct_filter = *owned_filter;
+			add(conjunct_filter, std::move(owned_filter));
 		}
 	}
 }
@@ -59,7 +137,7 @@ bool RowGroupMatchesFilters(ClientContext &context, const OasisScanGlobalState &
 	// Filter keys are output/projection indices, aligned with gstate.projected_columns.
 	for (size_t k = 0; k < lstate.scan_filters.size(); k++) {
 		size_t const out_idx = lstate.scan_filters[k].filter_idx;
-		if (out_idx >= gstate.projected_columns.size()) {
+		if (out_idx >= gstate.projected_columns.size() || !lstate.scan_filters[k].prune_on_stats) {
 			continue;
 		}
 		size_t const col_id = gstate.projected_columns[out_idx].column_id;

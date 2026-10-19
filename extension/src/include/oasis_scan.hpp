@@ -17,6 +17,7 @@
 #include <chrono>
 #include <deque>
 #include <mutex>
+#include <optional>
 
 namespace duckdb {
 
@@ -40,26 +41,39 @@ private:
 // Per-worker state for one pushed-down TableFilter. TableFilterState is not safe to share across
 // threads, so each worker owns its own (mirrors ParquetReader's per-scan-state scan_filters).
 struct OasisScanFilter {
-	OasisScanFilter(ClientContext &context, idx_t filter_idx, const TableFilter &filter)
-	    : filter_idx(filter_idx), filter(filter), filter_state(TableFilterState::Initialize(context, filter)) {
+	OasisScanFilter(ClientContext &context, idx_t filter_idx, const TableFilter &filter,
+	                unique_ptr<TableFilter> row_filter_p = nullptr)
+	    : filter_idx(filter_idx), filter(filter), row_filter(std::move(row_filter_p)),
+	      filter_state(TableFilterState::Initialize(context, row_filter ? *row_filter : filter)) {
 	}
 
 	// Owning variant: Used for filters synthesized by splitting a pushed-down AND into its
 	// conjuncts, so each conjunct is classified and evaluated independently.
-	OasisScanFilter(ClientContext &context, idx_t filter_idx, unique_ptr<TableFilter> owned_filter_p)
+	OasisScanFilter(ClientContext &context, idx_t filter_idx, unique_ptr<TableFilter> owned_filter_p,
+	                unique_ptr<TableFilter> row_filter_p = nullptr)
 	    : filter_idx(filter_idx), owned_filter(std::move(owned_filter_p)), filter(*owned_filter),
-	      filter_state(TableFilterState::Initialize(context, *owned_filter)) {
+	      row_filter(std::move(row_filter_p)),
+	      filter_state(TableFilterState::Initialize(context, row_filter ? *row_filter : *owned_filter)) {
 	}
 
 	idx_t filter_idx;
 	unique_ptr<TableFilter> owned_filter; // null when `filter` references a gstate-owned filter
 	const TableFilter &filter;
+	// `filter` rebound to the type the scan outputs, when a cast pushed into the scan narrowed the
+	// column after the filter was bound to its file type (e.g. a dynamic join filter). Null otherwise.
+	// Row-level evaluation uses it, statistics pruning `filter`.
+	unique_ptr<TableFilter> row_filter;
 	unique_ptr<TableFilterState> filter_state;
+	// Whether `filter` takes the file type of the column, the type of the column chunk statistics.
+	bool prune_on_stats = true;
 };
 
 struct OasisScanBindData : public TableFunctionData {
-	// DuckDB type of every file column, as read_parquet would report it (the scan's return types).
+	// DuckDB type of every file column, as read_parquet would report it.
 	vector<LogicalType> column_types;
+	// DuckDB type the scan returns per file column: column_types, or the narrower type of a cast
+	// pushed into the scan (oasis_cast_pushdown).
+	vector<LogicalType> output_types;
 	string filename;
 	parcore::metadata::Metadata metadata;
 	shared_ptr<ParquetFileMetadataCache> parquet_metadata;
@@ -72,6 +86,11 @@ struct ProjectedColumn {
 	size_t column_id;
 	size_t elem_size; // 0 for CPU (string) columns
 	bool is_cpu;      // variable-length column decoded on the CPU path, not the FPGA
+	// Signed 64-bit integer column (BIGINT or DECIMAL on INT64) whose chunks may be transferred as
+	// INT32 when their statistics fit (see oasis_narrow_transfer). The scan widens them back.
+	bool narrowable = false;
+	// Type the decoders cast the column to for a cast pushed into the scan (oasis_cast_pushdown).
+	std::optional<libstf::type_t> cast_type;
 };
 
 // Global scan state shared across all DuckDB worker threads of one read_oasis scan. Following
@@ -84,6 +103,10 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 
 	vector<ProjectedColumn> projected_columns;
 	bool has_cpu_columns = false;
+
+	// Whether chunks of narrowable columns are decoded to INT32 when their statistics fit
+	// (oasis_narrow_transfer).
+	bool narrow_transfer = false;
 
 	// filter_prune support. When the plan consumes fewer columns than the scan reads (some are
 	// filter-only), can_prune is set, projection_ids holds the indices (into projected_columns)
@@ -171,6 +194,9 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 		std::vector<const parcore::metadata::ColumnChunk *> hw_chunks;
 		std::vector<CoalescedFetcher::RangeHandle> host_handles;
 
+		// Per projection index: whether the column's chunk of this group is transferred as INT32.
+		std::vector<bool> narrowed;
+
 		// CPU (string) columns of this group: Fetched over RDMA as raw bypass flows: cpu_slot[k]
         // is the projection index, cpu_chunks[k] the chunk.
 		std::vector<size_t> cpu_slot;
@@ -189,6 +215,9 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 	bool groups_exhausted = false;
 
 	std::vector<std::shared_ptr<libstf::Buffer>> current_buffers;
+
+	// The current group's narrowed flags (see PendingGroup).
+	std::vector<bool> current_narrowed;
 
 	// The current group's needs_row_filter mask (see PendingGroup), consumed by DecodeAndFilterSlice.
 	std::vector<bool> current_needs_row_filter;

@@ -49,6 +49,19 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "cold start, letting other workers prime the pipeline breadth-first. Set false to disable "
 	    "yielding entirely.",
 	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption(
+	    "oasis_narrow_transfer",
+	    "Whether read_oasis decodes BIGINT and DECIMAL column chunks whose statistics fit into INT32 "
+	    "as INT32 and widens them on the CPU, halving their transfer from the FPGA. Needs a bitstream "
+	    "whose decoders cast INT64 to INT32.",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption(
+	    "oasis_cast_pushdown",
+	    "Whether read_oasis accepts integer narrowing casts that DuckDB pushes into the scan (e.g. BIGINT "
+	    "join keys cast to INTEGER) when the file statistics prove that all values fit, and decodes the "
+	    "column directly to the narrow type. BIGINT columns need a bitstream whose decoders cast INT64 "
+	    "to INT32.",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
 	// Oasis scan table function
 	RegisterOasisScanFunction(loader);

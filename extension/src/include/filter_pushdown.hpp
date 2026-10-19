@@ -9,8 +9,9 @@ namespace duckdb {
 // filters, e.g. a dynamic join min/max range plus a bloom filter) is split into one scan filter
 // per conjunct, so RowGroupMatchesFilters can classify each conjunct independently: A conjunct
 // the group's statistics prove always-true is skipped without disabling its selective siblings.
-void BuildScanFilters(ClientContext &context, const TableFilterSet &filters,
-                      std::vector<OasisScanFilter> &scan_filters);
+// Filters on a column narrowed by a cast pushed into the scan are rebound to the narrow type.
+void BuildScanFilters(ClientContext &context, const TableFilterSet &filters, const OasisScanGlobalState &gstate,
+                      const OasisScanBindData &bind, std::vector<OasisScanFilter> &scan_filters);
 
 // Returns false if the pushed-down filters prove `group` cannot contain any matching row. Mirrors
 // the statistics-pruning logic of DuckDB's ParquetReader::PrepareRowGroupBuffer: For each projected

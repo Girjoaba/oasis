@@ -20,6 +20,8 @@ reads from the configured RDMA file server.
 | `oasis_scan_groups_in_flight` | `16` | Row groups a scan keeps submitted but not yet collected, split across its workers |
 | `oasis_rdma_server` | — | RDMA file server IP; required for `rdma://` |
 | `oasis_rdma_port` | Coyote default | TCP port for the QP exchange |
+| `oasis_narrow_transfer` | `false` | Decode BIGINT/DECIMAL column chunks whose statistics fit as INT32 and widen them on the CPU |
+| `oasis_cast_pushdown` | `false` | Accept integer narrowing casts pushed into the scan when the file statistics fit, and decode the column to the narrow type |
 
 ## Building
 
