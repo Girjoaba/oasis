@@ -17,7 +17,8 @@ class RDMAReadTestCase(fpga_test_case.FPGATestCase):
 
     # Method that gets executed once per test case
     def setUp(self):
-        return super().setUp()
+        super().setUp()
+        self.overwrite_simulation_time(fpga_test_case.SimulationTime.fixed_time(40, fpga_test_case.SimulationTimeUnit.MICROSECONDS))
     
     # Overwrite of the parent classes simulation method.
     # Can be used to implement common behavior between tests
