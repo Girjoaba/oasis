@@ -143,7 +143,12 @@ void OasisContext::initRDMA(const std::string &server, uint16_t port) {
 
     rdma_cthreads_.reserve(read_req_config->num_streams());
     for (libstf::stream_t stream = 0; stream < read_req_config->num_streams(); ++stream) {
+#ifdef EN_SIMULATION
+        // The simulation cThread starts one simulator per instance, so one cThread serves every stream
+        auto cthread = cthread_;
+#else
         auto cthread = std::make_shared<coyote::cThread>(vfpga_id_, getpid(), device_id_);
+#endif
 
         void *staging_buffer = nullptr;
         if (!memory_pool_->allocate(RDMA_INIT_STUB_SIZE, &staging_buffer).ok()) {
