@@ -49,6 +49,11 @@ After this script is finished, VSCode shows the unit tests as a test flask on th
 UI. Run unit tests by clicking on the corresponding run button. The simulation project needs to be
 regenerated whenever new files are added (also true for the dependencies).
 
+### Scenarios
+`scenarios/` holds end-to-end runs of the DuckDB extension against the simulated vFPGA with a
+network model, for example TPC-H Q6 over RDMA: `scenarios/run.py` runs one scenario file and
+writes `result.json`. See [scenarios/README.md](scenarios/README.md).
+
 ### Synthesis
 For synthesis, execute the following command (only tested for the build servers in the
 [HACC](https://github.com/fpgasystems/hacc), i.e., `hacc-build-**`):

@@ -1,0 +1,17 @@
+{
+  "name": "tpch_q6_10g",
+  "network": {
+    "model": "mock",
+    "seed": 1,
+    "ports": {
+      "rdma": {"latency_ns": 2000, "gbps": 10, "mtu": 4096, "jitter_ns": 1000, "drop": 0}
+    }
+  },
+  "image": "image.bin",
+  "files": ["lineitem.parquet"],
+  "sql": "q6.sql",
+  "checks": [
+    {"expect": {"count_star()": 60175}},
+    {"equal": ["revenue", "revenue_native"]}
+  ]
+}
