@@ -32,6 +32,8 @@ jobs:
     # celeris is private and the Coyote network stack is not simulated: only what the build needs.
     - name: Submodules
       run: |
+        # .gitmodules of Oasis and libstf name parcore and Coyote over SSH; the runner has no key, every repo is public.
+        git config --global url.https://github.com/.insteadOf git@github.com:
         git submodule update --init --depth 1 extension/duckdb extension/extension-ci-tools parcore
         git -C parcore submodule update --init --depth 1 libstf vhsnunzip
         git -C parcore/libstf submodule update --init --depth 1 coyote
