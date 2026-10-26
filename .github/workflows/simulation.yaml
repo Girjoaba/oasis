@@ -1,0 +1,99 @@
+# TPC-H Q6 through the DuckDB extension against the simulated Oasis vFPGA under Verilator.
+# The hardware build comes from hardware/sim_frozen (sim/vl/freeze.sh of the Coyote submodule);
+# scripts/ci/pin_submodules.sh moves parcore, libstf and Coyote to the commits that folder records;
+# scripts/ci/q6_verilator.sh builds the software stack, the Verilator binary and runs the scenario.
+# The first run builds DuckDB (about an hour on the hosted runner); later runs take its objects from the ccache cache.
+name: Simulation
+
+on:
+  push:
+    branches: [features/system-sim, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: simulation-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  tpch-q6-verilator:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: false
+
+    # celeris is private and the Coyote network stack is not simulated: only what the build needs.
+    - name: Submodules
+      run: |
+        git submodule update --init --depth 1 extension/duckdb extension/extension-ci-tools parcore
+        git -C parcore submodule update --init --depth 1 libstf vhsnunzip
+        git -C parcore/libstf submodule update --init --depth 1 coyote
+
+    - name: Pin the submodules to the frozen commits
+      run: scripts/ci/pin_submodules.sh hardware/sim_frozen
+
+    # GHDL for the vhsnunzip model, and a Verilator at or after the pin of sim/vl/verilator.env of the
+    # Coyote submodule (build.sh refuses an older one): move this release with that pin.
+    - uses: YosysHQ/setup-oss-cad-suite@v3
+      with:
+        version: '2026-10-23'
+
+    - name: Packages
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build ccache libboost-all-dev autoconf unzip wget jq
+        python3 -m pip install --user duckdb
+        verilator --version && ghdl --version | head -1 && cmake --version | head -1
+
+    - name: Cache keys
+      run: |
+        echo "DUCKDB_SHA=$(git -C extension/duckdb rev-parse HEAD)" >> "$GITHUB_ENV"
+        echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV"
+
+    - name: jemalloc cache
+      uses: actions/cache@v4
+      with:
+        path: ~/opt
+        key: jemalloc-5.3.0
+
+    - name: ccache cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/ccache
+        key: ccache-${{ env.DUCKDB_SHA }}-${{ hashFiles('extension/src/**', 'extension/CMakeLists.txt') }}
+        restore-keys: |
+          ccache-${{ env.DUCKDB_SHA }}-
+          ccache-
+
+    - name: Build and run Q6
+      run: |
+        ccache --max-size 2G --zero-stats
+        scripts/ci/q6_verilator.sh
+        ccache --show-stats
+
+    - name: Summary
+      if: always()
+      run: |
+        if [ -f runs/q6/result.json ]; then
+          jq -r '"Q6 \(.simulator): pass=\(.pass) rows=\(.values["count_star()"]) revenue=\(.values.revenue) stalled=\(.values.in_stalled_cycles) starved=\(.values.in_starved_cycles) simulated_ns=\(.simulated_ns) wall_s=\(.wall_s)"' runs/q6/result.json | tee -a "$GITHUB_STEP_SUMMARY"
+        else
+          echo "no result.json: the run stopped before the scenario" | tee -a "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Run folder and build logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: q6-verilator
+        if-no-files-found: ignore
+        path: |
+          runs/q6
+          ${{ runner.temp }}/sim-vl/build.log
+          ${{ runner.temp }}/sim-build/*.log

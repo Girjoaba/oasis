@@ -30,10 +30,11 @@ DEFAULT_DUCKDB = OASIS / "extension" / "build" / "release" / "duckdb"
 DEFAULT_VFPGA_TOP = OASIS / "hardware" / "src" / "vfpga_top.svh"
 
 # Network model `mock`: the port timing of the sim/hw mocks of Coyote. The variable of a
-# parameter is COYOTE_SIM_<PORT>_<PARAM> (sim/hw/sim_params.svh of the Coyote submodule).
+# parameter is COYOTE_SIM_<PORT>_<PARAM>, read in SIM_PARAMS of the Coyote submodule.
 # This is the only place that names these variables; the scenario file never does.
 PORTS = ("host", "card", "rdma")
 PARAMS = ("latency_ns", "gbps", "mtu", "jitter_ns", "drop", "retransmit_ns")
+SIM_PARAMS = OASIS / "parcore" / "libstf" / "coyote" / "sim" / "hw" / "sim_params.svh"
 
 SIM_LOGS = {
     "xsim": "sim/*.sim/sim_1/behav/xsim/simulate.log",
@@ -48,7 +49,6 @@ class Scenario(NamedTuple):
     name: str
     network: dict
     checks: List[dict]
-    env: Dict[str, str]  # the COYOTE_SIM_* variables of the network section
     sql: Path
     image: Optional[Path]
     files: List[Path]
@@ -69,6 +69,11 @@ def mock_env(network: dict) -> Dict[str, str]:
             if name not in PARAMS:
                 raise ValueError(f"unknown parameter {name!r} of port {port!r}, expected one of {sorted(PARAMS)}")
             env[f"COYOTE_SIM_{port.upper()}_{name.upper()}"] = str(value)
+    # The mocks build the names as "COYOTE_SIM_" + port + "_<PARAM>"; a rename there must fail here.
+    mocks = SIM_PARAMS.read_text()
+    for var in env:
+        if (var if var == "COYOTE_SIM_SEED" else "_" + var.split("_", 3)[3]) not in mocks:
+            raise ValueError(f"{var} is not read by {SIM_PARAMS}: PARAMS of run.py drifted from the Coyote mocks")
     return env
 
 
@@ -77,12 +82,12 @@ def load_scenario(path: Path) -> Scenario:
     for key in ("name", "network", "sql"):
         if key not in raw:
             raise ValueError(f"{path}: missing field {key!r}")
+    mock_env(raw["network"])  # rejects a bad network section before anything runs
     base = path.parent
     scenario = Scenario(
         name=raw["name"],
         network=raw["network"],
         checks=raw.get("checks", []),
-        env=mock_env(raw["network"]),
         sql=(base / raw["sql"]).resolve(),
         image=(base / raw["image"]).resolve() if "image" in raw else None,
         files=[(base / f).resolve() for f in raw.get("files", [])],
@@ -162,7 +167,7 @@ def read_tail(path: Path, size: int = LOG_TAIL_BYTES) -> str:
 
 def build_env(scenario: Scenario, sim_dir: Path, verilator_bin: Optional[Path]) -> Dict[str, str]:
     env = {k: v for k, v in os.environ.items() if not k.startswith("COYOTE_SIM_")}
-    env.update(scenario.env)
+    env.update(mock_env(scenario.network))
     env["COYOTE_SIM_DIR"] = str(sim_dir)
     env["COYOTE_SIM_VCD"] = "0"
     if scenario.image is not None:
@@ -173,7 +178,11 @@ def build_env(scenario: Scenario, sim_dir: Path, verilator_bin: Optional[Path]) 
 
 
 def place_vfpga_top(source: Path, sim_dir: Path, verilator_bin: Optional[Path]) -> Optional[str]:
-    """Puts the top into the build folder (unchanged mtime when the content is the same). Returns a warning or None."""
+    """Puts the top into the build folder (unchanged mtime when the content is the same). Returns a warning or None.
+
+    The same rule as _copy_if_changed in sim/unit_test/process_runner.py of the Coyote submodule;
+    a copy, because this script runs without the Python test framework of a hardware build on sys.path.
+    """
     target = sim_dir / "sim" / "vfpga_top.svh"
     content = source.read_text()
     if not target.is_file() or target.read_text() != content:

@@ -54,6 +54,14 @@ regenerated whenever new files are added (also true for the dependencies).
 network model, for example TPC-H Q6 over RDMA: `scenarios/run.py` runs one scenario file and
 writes `result.json`. See [scenarios/README.md](scenarios/README.md).
 
+The workflow `.github/workflows/simulation.yaml` runs the TPC-H Q6 under Verilator on every push, without Vivado: `hardware/sim_frozen/` holds the file lists and the generated sources of the simulation project, and `FROZEN` in it the submodule commits the run checks out (`scripts/ci/pin_submodules.sh`). Verilator compiles no VHDL, so `hardware/sim_models/` carries Verilog for the VHDL entities of the vFPGA. After a change of the hardware, make the frozen folder again on a machine with Vivado, after `make sim` and the Verilator build:
+
+```bash
+parcore/libstf/coyote/sim/vl/freeze.sh <build-sim> <build-vl> hardware/sim_frozen .
+```
+
+The last argument is the checkout, so the file lists carry no absolute path. Commit the folder.
+
 ### Synthesis
 For synthesis, execute the following command (only tested for the build servers in the
 [HACC](https://github.com/fpgasystems/hacc), i.e., `hacc-build-**`):

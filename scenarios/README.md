@@ -1,13 +1,13 @@
 # Scenarios
 
-One command runs the DuckDB extension against the simulated vFPGA with a given network model and writes `result.json`. `run.py` needs Python 3.10 and nothing else.
+One command runs the DuckDB extension against the simulated vFPGA with a given network model and writes `result.json`. `run.py` needs Python 3.10.
 
 ```bash
 $ scenarios/run.py scenarios/tpch_q6/scenario.json --sim-dir path/to/build-sim \
     [--duckdb path/to/duckdb] [--verilator-bin path/to/coyote_vl] [--out runs/q6]
 ```
 
-`--sim-dir` is the hardware simulation build (`COYOTE_SIM_DIR`). `--duckdb` is the shell built against the simulation library (`EN_SIMULATION`), by default `extension/build/release/duckdb` of this checkout; its libraries must be on `LD_LIBRARY_PATH`. Without `--verilator-bin` the run uses Vivado xsim, so `vivado` must be in `PATH`. `--vfpga-top FILE` places that top into `<sim-dir>/sim/vfpga_top.svh` before the run, by default `hardware/src/vfpga_top.svh` (the unit tests replace it with their own top). `--timeout S` kills the shell after `S` seconds (default 7200).
+`--sim-dir` is the hardware simulation build (`COYOTE_SIM_DIR`). `--duckdb` is the shell built against the simulation library (`EN_SIMULATION`). Its libraries must be on `LD_LIBRARY_PATH`. Without `--verilator-bin` the run uses Vivado xsim. `--vfpga-top FILE` places that top into `<sim-dir>/sim/vfpga_top.svh` before the run. `--timeout S` kills the shell after `S` seconds (default 7200).
 
 The exit code is 0 when every check passes, 1 when one fails, 2 on a bad scenario.
 
@@ -25,7 +25,7 @@ The exit code is 0 when every check passes, 1 when one fails, 2 on a bad scenari
 }
 ```
 
-Paths are relative to the scenario file. `network.model` is `mock`: the memory mocks of the Coyote simulation, with the timing of the ports `host`, `card` and `rdma` (`latency_ns`, `gbps`, `mtu`, `jitter_ns`, `drop`, `retransmit_ns`; meaning and defaults in `sim/README.md` of the Coyote submodule, "Timing parameters"). `run.py` turns the `network` section into the `COYOTE_SIM_*` variables of the simulator; the scenario file never names them. `image` is the memory image of the RDMA mock (`COYOTE_SIM_RDMA_IMAGE`), `files` are linked into the run folder so the SQL can name them, `sql` goes to the DuckDB shell. A check is `expect` (column equals value) or `equal` (columns equal each other) over the columns of every one-row result; numbers compare as decimals.
+Paths are relative to the scenario file. `network.model` is `mock`: the memory mocks of the Coyote simulation, with the timing of the ports `host`, `card` and `rdma` (`latency_ns`, `gbps`, `mtu`, `jitter_ns`, `drop`, `retransmit_ns`). `image` is the memory image of the RDMA mock (`COYOTE_SIM_RDMA_IMAGE`), `files` are linked into the run folder so the SQL can name them, `sql` goes to the DuckDB shell. A check is `expect` (column equals value) or `equal` (columns equal each other) over the columns of every one-row result.
 
 ## Result
 
@@ -46,7 +46,3 @@ The run folder (`--out`, default `runs/<name>_<time>`) holds `result.json`, `duc
 - `prepare.py`: writes `lineitem.parquet` at scale factor 0.01 with the `duckdb` module and packs `image.bin` with `rdma_server/pack_image.py`. Both files are not committed.
 
 The checks of every scenario: 60 175 rows, and the revenue through Oasis equals the native one.
-
-## Tests
-
-`python3 -m unittest discover -s scenarios/tests` checks the runner without a simulator: result parsing, the checks, the variables of the mock against `sim_params.svh` of the Coyote submodule, and the three scenario files.

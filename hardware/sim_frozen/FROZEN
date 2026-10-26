@@ -1,0 +1,12 @@
+date: 2026-10-26T09:12:07+01:00
+hw_build: /pub/scratch/agirjoaba/coyote-system-sim/build/oasis-rdma
+src_root: /pub/scratch/agirjoaba/coyote-system-sim/oasis-t0n
+src_commit: 6d87d91
+submodule: extension/duckdb b6013f7aa2f36caabb9466ce1791667ea8a280bb
+submodule: extension/extension-ci-tools 3128ab7ebb8c607f5c3ab2fe8397f1dfb56942f5
+submodule: parcore b95769f97f6d1a7a85a266c6c75a56bab517e57f
+submodule: parcore/libstf 69aca7536bba4206f33dde845733e22c8d1fc099
+submodule: parcore/libstf/coyote 34fcc78eb8d85beeb9abdaf3cf706e26a5ab8515
+submodule: parcore/libstf/coyote/hw/services/network 1197a9dfa172b34c50ad5ee0a418a53fdddff146
+submodule: parcore/vhsnunzip ef9012071f2c6bf8930a2545ee5f1cb360175a0b
+vivado: Vivado v2024.2

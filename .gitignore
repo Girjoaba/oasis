@@ -1,5 +1,7 @@
 .claude
 build*
+# The frozen simulation project (sim/vl/freeze.sh of the Coyote submodule) keeps its generated sources under build/
+!hardware/sim_frozen/build/
 
 # Generated unit test files
 hardware/unit-tests/diff/**
