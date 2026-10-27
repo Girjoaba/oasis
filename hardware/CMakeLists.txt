@@ -4,6 +4,10 @@ project(oasis)
 set(CYT_DIR ${CMAKE_SOURCE_DIR}/../parcore/libstf/coyote)
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CYT_DIR}/cmake)
 
+# Target FPGA device (override with -DFDEV_NAME=v80 for the Alveo V80).
+# Before find_package: CoyoteHW creates the cache entry with "0", and a later set() cannot change it.
+set(FDEV_NAME u55c CACHE STRING "Target FPGA device (u55c, v80, ...)")
+
 find_package(CoyoteHW REQUIRED)
 
 # Number of ColumnChunkDecoders. The number of streams is equal to this in local mode. If RDMA is 
@@ -30,9 +34,6 @@ endif()
 # Build with optimization, since timing closure can be difficult
 set(COMP_CORES 64)
 set(BUILD_OPT 1)
-
-# Target FPGA device (override with -DFDEV_NAME=v80 for the Alveo V80)
-set(FDEV_NAME u55c CACHE STRING "Target FPGA device (u55c, v80, ...)")
 
 # Enable 1 GiB huge pages in the TLB
 set(TLBL_BITS 30)

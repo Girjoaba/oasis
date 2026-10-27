@@ -1,5 +1,0 @@
--I@BUILD_DIR@/sim
--I@SRC_DIR@/parcore/libstf/coyote/hw/hdl/pkg
--I@SRC_DIR@/parcore/libstf/coyote/sim/hw
--I@SRC_DIR@/parcore/libstf/hardware/src/hdl
--I@SRC_DIR@/parcore/libstf/hardware/src/hdl/config

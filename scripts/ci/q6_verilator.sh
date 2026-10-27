@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# Build the Oasis software against the Coyote simulation library, the frozen Oasis vFPGA with
-# Verilator, and run the TPC-H Q6 scenario. No Vivado: the hardware build comes from
-# hardware/sim_frozen (sim/vl/freeze.sh of the Coyote submodule).
+# Build the Oasis software against the Coyote simulation library, the Oasis vFPGA with Verilator,
+# and run the TPC-H Q6 scenario. No Vivado: sim/vl/configure.sh of the Coyote submodule configures
+# hardware/ with a stub Vivado and writes the generated sources and the file lists from the checkout.
 #
 # Usage: scripts/ci/q6_verilator.sh
 #   from the Oasis checkout, after scripts/ci/pin_submodules.sh. The exit code is the one of
 #   scenarios/run.py: 0 when every check of the scenario passes.
 #
 # Needs in PATH: verilator (the pin of sim/vl/verilator.env of the Coyote submodule or newer),
-# ghdl (5 or newer, Verilog output), cmake, ninja, g++, python3 with the duckdb module, and ccache
+# ghdl (5 or newer, Verilog output), cmake, ninja, g++, python3 with the duckdb and jinja2 modules, and ccache
 # when the DuckDB build should be cached. Boost headers, autoconf and wget for jemalloc.
 #
 # Environment (all optional):
 #   OPT      prefix of jemalloc (default $HOME/opt; kept when $OPT/lib/libjemalloc.so exists)
 #   OPT_SIM  prefix of the simulation library, libstf, parcore and oasis (default $HOME/opt-sim)
 #   BUILD    folder of the CMake build trees (default $RUNNER_TEMP/sim-build, or /tmp/sim-build)
-#   WORK     the unfrozen hardware build, COYOTE_SIM_DIR of the run (default $RUNNER_TEMP/sim-work)
+#   WORK     the hardware build folder, COYOTE_SIM_DIR of the run (default $RUNNER_TEMP/sim-work)
 #   VL_OUT   output of the Verilator build (default $RUNNER_TEMP/sim-vl)
 #   OUT      run folder of the scenario (default runs/q6 in the checkout)
 #   SCENARIO scenario file (default scenarios/tpch_q6/scenario.json)
@@ -55,8 +55,8 @@ fi
 step "vhsnunzip to Verilog (GHDL)"
 "$OASIS/hardware/sim_models/gen_vhsnunzip.sh"
 
-step "Verilator build of the frozen vFPGA"
-"$CYT/sim/vl/unfreeze.sh" "$OASIS/hardware/sim_frozen" "$WORK" "$OASIS"
+step "Verilator build of the vFPGA"
+"$CYT/sim/vl/configure.sh" "$OASIS/hardware" "$WORK"
 VL_MODELS=$OASIS/hardware/sim_models JOBS=$JOBS "$CYT/sim/vl/build.sh" "$WORK" "$VL_OUT"
 
 step "jemalloc in $OPT"
