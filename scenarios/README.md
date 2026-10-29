@@ -25,7 +25,7 @@ The exit code is 0 when every check passes, 1 when one fails, 2 on a bad scenari
 }
 ```
 
-Paths are relative to the scenario file. `network.model` is `mock`: the memory mocks of the Coyote simulation, with the timing of the ports `host`, `card` and `rdma` (`latency_ns`, `gbps`, `mtu`, `jitter_ns`, `drop`, `retransmit_ns`). `image` is the memory image of the RDMA mock (`COYOTE_SIM_RDMA_IMAGE`), `files` are linked into the run folder so the SQL can name them, `sql` goes to the DuckDB shell. A check is `expect` (column equals value) or `equal` (columns equal each other) over the columns of every one-row result.
+Paths are relative to the scenario file. `network.model` is `mock`: the memory mocks of the Coyote simulation, with the timing of the ports `host`, `card` and `rdma` (`latency_ns`, `gbps`, `mtu`, `jitter_ns`, `drop`, `retransmit_ns`). `image` is the memory image of the RDMA mock (`COYOTE_SIM_RDMA_IMAGE`), `files` are linked into the run folder so the SQL can name them, `sql` goes to the DuckDB shell. A check is `expect` (column equals value), `equal` (columns equal each other) or `zero_or_error` (each column is 0 or missing, because its statement failed) over the columns of every one-row result. The shell runs every statement and exits 1 when one failed; `"allow_errors": true` accepts that exit code, any other code still fails the run.
 
 ## Result
 
@@ -46,3 +46,24 @@ The run folder (`--out`, default `runs/<name>_<time>`) holds `result.json`, `duc
 - `prepare.py`: writes `lineitem.parquet` at scale factor 0.01 with the `duckdb` module and packs `image.bin` with `rdma_server/pack_image.py`. Both files are not committed.
 
 The checks of every scenario: 60 175 rows, and the revenue through Oasis equals the native one.
+
+## Correctness suite
+
+`correctness/prepare.py` writes the data and the scenarios into `correctness/out/`. Every scenario reads the same files through `read_oasis` and through `read_parquet` and counts the rows that differ in either direction (`EXCEPT ALL` both ways):
+
+| Scenario | Content | Checks |
+|---|---|---|
+| `tpch_q01` to `tpch_q22` | one TPC-H query of `tpch_queries()`, scale factor 0.01, over `rdma://` | `diff_rows` = 0, `hw_used`, `done` |
+| `edge` | the edge cases of `CASES` (types, limits, layouts, encodings, filters) | `diff_<case>` = 0 for every case, `hw_used`, `done` |
+| `gap_<case>` | one input of `GAPS` that the decoder does not support yet (NULLs, BOOLEAN, V2 encodings, ZSTD, DECIMAL(38), empty file) | `zero_or_error`: correct or a clean error, never wrong rows; `done` |
+
+`hw_used` checks that the decoders saw input (`oasis_stream_profile()`), so a scan that ran only on the CPU fails. `done` is the last statement, so a crashed shell fails. Each gap is its own scenario, so a case that hangs or crashes the shell does not hide the others. When a gap is fixed, move its case from `GAPS` to `CASES`.
+
+All scenarios read over `rdma://`. The build enables RDMA, and `read_oasis` on a local file then stops the process.
+
+```bash
+$ python3 scenarios/correctness/prepare.py
+$ scripts/ci/run_scenario.sh tpch_q01        # after scripts/ci/sim_build.sh, with the same sim_env.sh variables
+```
+
+The CI workflow (`.github/workflows/simulation.yaml`) builds once, packs the build with `scripts/ci/bundle.sh` and runs every name of `out/scenarios.json` in its own job.

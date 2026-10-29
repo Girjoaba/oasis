@@ -52,6 +52,7 @@ class Scenario(NamedTuple):
     sql: Path
     image: Optional[Path]
     files: List[Path]
+    allow_errors: bool
 
 
 def mock_env(network: dict) -> Dict[str, str]:
@@ -91,6 +92,7 @@ def load_scenario(path: Path) -> Scenario:
         sql=(base / raw["sql"]).resolve(),
         image=(base / raw["image"]).resolve() if "image" in raw else None,
         files=[(base / f).resolve() for f in raw.get("files", [])],
+        allow_errors=bool(raw.get("allow_errors", False)),
     )
     for f in [scenario.sql, scenario.image, *scenario.files]:
         if f is not None and not f.is_file():
@@ -139,6 +141,12 @@ def evaluate_checks(checks: List[dict], values: Dict[str, Any]) -> List[dict]:
             got = {k: values.get(k) for k in check["expect"]}
             ok = all(k in values and _same(values[k], v) for k, v in check["expect"].items())
             out.append({"expect": check["expect"], "got": got, "ok": ok})
+        elif "zero_or_error" in check:
+            # A column that is missing comes from a statement that failed: got shows it as null.
+            keys = check["zero_or_error"]
+            got = {k: values.get(k) for k in keys}
+            ok = all(k not in values or _same(values[k], 0) for k in keys)
+            out.append({"zero_or_error": keys, "got": got, "ok": ok})
         else:
             out.append({"unknown": check, "ok": False})
     return out
@@ -260,7 +268,9 @@ def main(argv=None) -> int:
         warnings.append(f"duckdb.out is not JSON: {e}")
     values = single_row_values(results)
     checks = evaluate_checks(scenario.checks, values)
-    passed = rc == 0 and not timed_out and all(c["ok"] for c in checks)
+    # The shell exits 1 when a statement failed and goes on with the next one; a crash gives another code.
+    rc_ok = rc == 0 or (scenario.allow_errors and rc == 1)
+    passed = rc_ok and not timed_out and all(c["ok"] for c in checks)
 
     result = {
         "scenario": scenario.name,

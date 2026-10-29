@@ -1,7 +1,9 @@
-# TPC-H Q6 through the DuckDB extension against the simulated Oasis vFPGA under Verilator.
-# scripts/ci/pin_submodules.sh moves parcore, libstf and Coyote to the commits of scripts/ci/PINS;
-# scripts/ci/q6_verilator.sh builds the software stack, the Verilator binary (no Vivado: sim/vl/configure.sh
-# of the Coyote submodule) and runs the scenario.
+# Correctness of the DuckDB extension against the simulated Oasis vFPGA under Verilator.
+# Job build: scripts/ci/pin_submodules.sh moves parcore, libstf and Coyote to the commits of scripts/ci/PINS;
+# scripts/ci/sim_build.sh builds the software stack, the Verilator binary (no Vivado: sim/vl/configure.sh
+# of the Coyote submodule) and the DuckDB shell; scenarios/correctness/prepare.py writes the data and the
+# scenarios; scripts/ci/bundle.sh packs it all. Job run: one leg per scenario (the 22 TPC-H queries, the
+# edge cases and the known gaps), each compares read_oasis with read_parquet on the same files.
 # The first run builds DuckDB (about an hour on the hosted runner); later runs take its objects from the ccache cache.
 name: Simulation
 
@@ -20,9 +22,11 @@ defaults:
     shell: bash
 
 jobs:
-  tpch-q6-verilator:
+  build:
     runs-on: ubuntu-22.04
     timeout-minutes: 240
+    outputs:
+      scenarios: ${{ steps.prepare.outputs.scenarios }}
 
     steps:
     - uses: actions/checkout@v4
@@ -51,7 +55,7 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build ccache libboost-all-dev autoconf unzip wget jq
-        python3 -m pip install --user duckdb jinja2
+        python3 -m pip install --user duckdb pyarrow jinja2
         verilator --version && ghdl --version | head -1 && cmake --version | head -1
 
     - name: Cache keys
@@ -74,28 +78,84 @@ jobs:
           ccache-${{ env.DUCKDB_SHA }}-
           ccache-
 
-    - name: Build and run Q6
+    - name: Build
       run: |
         ccache --max-size 2G --zero-stats
-        scripts/ci/q6_verilator.sh
+        scripts/ci/sim_build.sh
         ccache --show-stats
+
+    - name: Scenarios
+      id: prepare
+      run: |
+        python3 scenarios/correctness/prepare.py
+        echo "scenarios=$(cat scenarios/correctness/out/scenarios.json)" >> "$GITHUB_OUTPUT"
+
+    - name: Bundle
+      run: scripts/ci/bundle.sh "$RUNNER_TEMP/sim-bundle.tar.gz"
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: sim-bundle
+        path: ${{ runner.temp }}/sim-bundle.tar.gz
+        compression-level: 0  # already gzip
+        retention-days: 1
+
+    - name: Build logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-logs
+        if-no-files-found: ignore
+        path: |
+          ${{ runner.temp }}/sim-vl/build.log
+          ${{ runner.temp }}/sim-build/*.log
+
+  run:
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: ${{ fromJSON(needs.build.outputs.scenarios) }}
+    name: ${{ matrix.scenario }}
+    # The gap legs show as failed but do not fail the run:
+    # (NULLs, BOOLEAN, Parquet V2 encodings, V2 data pages).
+    continue-on-error: ${{ startsWith(matrix.scenario, 'gap_') }}
+
+    steps:
+    # run.py, the scenario scripts and hardware/src/vfpga_top.svh; the bundle brings the rest.
+    - uses: actions/checkout@v4
+      with:
+        submodules: false
+
+    - uses: actions/download-artifact@v4
+      with:
+        name: sim-bundle
+        path: ${{ runner.temp }}
+
+    - name: Unpack
+      run: tar -xPzf "$RUNNER_TEMP/sim-bundle.tar.gz"
+
+    - name: Run ${{ matrix.scenario }}
+      env:
+        TIMEOUT: ${{ startsWith(matrix.scenario, 'gap_') && 180 || 600 }}
+      run: scripts/ci/run_scenario.sh ${{ matrix.scenario }}
 
     - name: Summary
       if: always()
       run: |
-        if [ -f runs/q6/result.json ]; then
-          jq -r '"Q6 \(.simulator): pass=\(.pass) rows=\(.values["count_star()"]) revenue=\(.values.revenue) stalled=\(.values.in_stalled_cycles) starved=\(.values.in_starved_cycles) simulated_ns=\(.simulated_ns) wall_s=\(.wall_s)"' runs/q6/result.json | tee -a "$GITHUB_STEP_SUMMARY"
+        r=runs/${{ matrix.scenario }}/result.json
+        if [ -f "$r" ]; then
+          jq -r '"\(.scenario): pass=\(.pass) rc=\(.rc) wall_s=\(.wall_s) simulated_ns=\(.simulated_ns)", (.checks[] | select(.ok | not) | "failed: \(.got)")' "$r" | tee -a "$GITHUB_STEP_SUMMARY"
         else
-          echo "no result.json: the run stopped before the scenario" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "${{ matrix.scenario }}: no result.json, the run stopped before the scenario" | tee -a "$GITHUB_STEP_SUMMARY"
         fi
 
-    - name: Run folder and build logs
-      if: always()
+    - name: Run folder
+      if: failure()
       uses: actions/upload-artifact@v4
       with:
-        name: q6-verilator
+        name: run-${{ matrix.scenario }}
         if-no-files-found: ignore
-        path: |
-          runs/q6
-          ${{ runner.temp }}/sim-vl/build.log
-          ${{ runner.temp }}/sim-build/*.log
+        path: runs/${{ matrix.scenario }}
