@@ -36,7 +36,32 @@ void LocalSourceOperator::print(std::ostream &os) const {
     os << "LocalSource(ptr=" << input_buffer_->ptr << ", size=" << input_buffer_->size << ")";
 }
 
+std::ostream &operator<<(std::ostream &os, const FilterSpec &spec) {
+    os << "Filter(";
+    if (spec.compare) {
+        os << (spec.negate ? "not " : "") << "[" << spec.lo << ", " << spec.hi << "]";
+    } else {
+        os << "all";
+    }
+    if (spec.load_sel) {
+        os << ", load_sel";
+    }
+    if (spec.store_sel) {
+        os << ", store_sel";
+    }
+    os << (spec.emit ? ", emit" : ", no emit") << ")";
+    return os;
+}
+
 void DecodeColumnChunkOperator::apply(libstf::stream_t stream, OasisContext &ctx) {
+    // The filter conf goes first: the hardware holds the chunk back until it has one.
+    if (ctx.has_filter_config()) {
+        ctx.config<FilterConfig>()->enqueue(stream, filter_);
+    } else if (!filter_.is_passthrough()) {
+        throw std::runtime_error(
+            "Hardware design on device has no FilterConfig, but the flow filters a column chunk");
+    }
+
     auto config = ctx.config<parcore::ColumnChunkDecoderConfig>();
     config->enqueue_column_chunk(stream, compression_, num_values_, type_, is_required_,
                                  logical_type_);
@@ -45,7 +70,7 @@ void DecodeColumnChunkOperator::apply(libstf::stream_t stream, OasisContext &ctx
 void DecodeColumnChunkOperator::print(std::ostream &os) const {
     os << "DecodeColumnChunk(compression=" << compression_ << ", num_values=" << num_values_
        << ", type=" << type_ << ", is_required=" << is_required_
-       << ", logical_type=" << logical_type_ << ")";
+       << ", logical_type=" << logical_type_ << ", filter=" << filter_ << ")";
 }
 
 void LocalSinkOperator::apply(libstf::stream_t stream, OasisContext &ctx) {

@@ -38,6 +38,15 @@ private:
 	std::chrono::steady_clock::time_point start;
 };
 
+// Closed interval on the integer the hardware compares (the stored value: days for DATE, the
+// unscaled value for DECIMAL, the stored units for TIMESTAMP). With negate the values outside pass.
+// See hw_filter.hpp.
+struct HwInterval {
+	int64_t lo;
+	int64_t hi;
+	bool negate = false;
+};
+
 // Per-worker state for one pushed-down TableFilter. TableFilterState is not safe to share across
 // threads, so each worker owns its own (mirrors ParquetReader's per-scan-state scan_filters).
 struct OasisScanFilter {
@@ -66,6 +75,9 @@ struct OasisScanFilter {
 	unique_ptr<TableFilterState> filter_state;
 	// Whether `filter` takes the file type of the column, the type of the column chunk statistics.
 	bool prune_on_stats = true;
+	// The interval the hardware compares for this filter, if it is a comparison of the column with a
+	// constant the FilterStage can take (hw_filter.hpp). Set by ClassifyHardwareFilters.
+	std::optional<HwInterval> hw_interval;
 };
 
 struct OasisScanBindData : public TableFunctionData {
@@ -91,6 +103,11 @@ struct ProjectedColumn {
 	bool narrowable = false;
 	// Type the decoders cast the column to for a cast pushed into the scan (oasis_cast_pushdown).
 	std::optional<libstf::type_t> cast_type;
+
+	// Bytes per value the hardware writes for a chunk of the column, 4 for a narrowed chunk.
+	size_t TransferSize(bool narrowed) const {
+		return narrowed ? sizeof(int32_t) : elem_size;
+	}
 };
 
 // Global scan state shared across all DuckDB worker threads of one read_oasis scan. Following
@@ -117,6 +134,12 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	std::vector<bool> column_emitted;
 
 	optional_ptr<TableFilterSet> filters;
+
+	// Hardware filtering (oasis_hw_filter): the FilterStage of each decoder compares the values of a
+	// column chunk with an interval and drops the rows that fail from every column of the row group
+	// (hw_filter.hpp). Off for scans with CPU columns, which would need the selection on the host,
+	// and without the FilterStage in the bitstream.
+	bool hw_filter = false;
 
 	// Dynamic join filters (min/max pushed by hash joins into the probe-side scan). Our global
 	// state is created at schedule time (INITIALIZE_ON_SCHEDULE), before the build side has run,
@@ -145,6 +168,9 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	// finishes (OasisScanGetMetrics) and reported on the query profiling tree.
 	std::atomic<uint64_t> filter_time_ns {0};
 	std::atomic<uint64_t> string_decode_time_ns {0};
+	std::atomic<uint64_t> hw_filter_groups {0};
+	std::atomic<uint64_t> hw_filter_rows_in {0};
+	std::atomic<uint64_t> hw_filter_rows_out {0};
 
 	idx_t MaxThreads() const override {
 		return total_groups == 0 ? 1 : total_groups;
@@ -202,6 +228,15 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 		std::vector<size_t> cpu_slot;
 		std::vector<const parcore::metadata::ColumnChunk *> cpu_chunks;
 
+		// Hardware filtering of this group (PlanHardwareFilter): specs[k] is the FilterSpec of
+		// hw_chunks[k], order the k in which the chunks go to the decoder, hw_emit per projection
+		// index whether the hardware writes the column. Every emitted column has the rows of the
+		// filtered group.
+		bool hw_filtered = false;
+		std::vector<oasis::FilterSpec> specs;
+		std::vector<size_t> order;
+		std::vector<bool> hw_emit;
+
 		oasis::SplinterResultHandle result;
 		bool submitted = false;
 		size_t batches_remaining = 0;
@@ -222,6 +257,10 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 	// The current group's needs_row_filter mask (see PendingGroup), consumed by DecodeAndFilterSlice.
 	std::vector<bool> current_needs_row_filter;
 
+	// The current group's hw_emit flags (see PendingGroup): a hardware column the hardware did not
+	// write has no buffer contents and gets no vector.
+	std::vector<bool> current_hw_emit;
+
 	size_t current_buf_offset = 0;
 	size_t current_group_num_rows = 0;
 	idx_t current_group = 0;
@@ -230,6 +269,9 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 	// when the worker's scan finishes.
 	uint64_t filter_time_ns = 0;
 	uint64_t string_decode_time_ns = 0;
+	uint64_t hw_filter_groups = 0;
+	uint64_t hw_filter_rows_in = 0;
+	uint64_t hw_filter_rows_out = 0;
 };
 
 void RegisterOasisScanFunction(ExtensionLoader &loader);

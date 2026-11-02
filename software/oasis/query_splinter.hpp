@@ -59,15 +59,24 @@ inline StreamCapability required_capability(const OperatorFlow &flow) {
  * One unit of work the scheduler dispatches as a whole: A vector of OperatorFlows, each running on
  * its own hardware stream. The scheduler load-balances the flows across the active hardware streams
  * but completes the whole splinter only once every flow has completed.
+ *
+ * With pin_flows the DECODE flows run on one stream instead, in the order of `streams` and without
+ * the flows of another splinter in between. The FilterStage of a decoder carries the selection of
+ * a row group from its filter columns to its other columns, so the columns have to pass the same
+ * decoder one after the other.
  */
 class QuerySplinter {
   public:
     std::vector<OperatorFlow> streams;
+    bool                      pin_flows = false;
 
     [[nodiscard]] size_t num_flows() const { return streams.size(); }
 
     void print(std::ostream &os) const {
         os << "QuerySplinter(";
+        if (pin_flows) {
+            os << "pinned; ";
+        }
         for (size_t u = 0; u < streams.size(); ++u) {
             if (u > 0) {
                 os << "; ";

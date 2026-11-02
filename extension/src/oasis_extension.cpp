@@ -56,6 +56,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "whose decoders cast INT64 to INT32.",
 	    LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	config.AddExtensionOption(
+	    "oasis_hw_filter",
+	    "Whether read_oasis pushes constant comparisons on INTEGER, BIGINT, DATE, DECIMAL and TIMESTAMP "
+	    "columns into the decoders, which drop the failing rows of every column of the row group before "
+	    "the transfer. Needs a bitstream with the FilterStage. Scans with string columns and row groups "
+	    "with more rows than the selection bitmap holds are filtered on the CPU.",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption(
 	    "oasis_cast_pushdown",
 	    "Whether read_oasis accepts integer narrowing casts that DuckDB pushes into the scan (e.g. BIGINT "
 	    "join keys cast to INTEGER) when the file statistics prove that all values fit, and decodes the "

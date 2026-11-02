@@ -4,13 +4,10 @@ from coyote_test import fpga_stream
 
 from libstf_utils.configured_test_case import ConfiguredTestCase
 from libstf_utils.fpga_configuration import StreamConfig
-from oasis_utils.fpga_configuration import FilterCompareConfig
+from oasis_utils.fpga_configuration import FilterConfig, INT32_MIN, INT32_MAX, INT64_MIN, INT64_MAX
 
 INT32 = fpga_stream.StreamType.SIGNED_INT_32
 INT64 = fpga_stream.StreamType.SIGNED_INT_64
-
-INT32_MIN, INT32_MAX = -pow(2, 31), pow(2, 31) - 1
-INT64_MIN, INT64_MAX = -pow(2, 63), pow(2, 63) - 1
 
 
 class FilterCompareTestCase(ConfiguredTestCase):
@@ -24,11 +21,11 @@ class FilterCompareTestCase(ConfiguredTestCase):
 
     def configure(self):
         # The bounds are written before the stream type, which holds back the values till it arrives
-        filter_compare = self.config.get_config(FilterCompareConfig)
+        filter_config = self.config.get_config(FilterConfig)
         if self.bounds is None:
-            filter_compare.disable(0)
+            filter_config.enqueue(0, compare=False)
         else:
-            filter_compare.set_bounds(0, *self.bounds, negate=self.negate)
+            filter_config.enqueue(0, *self.bounds, compare=True, negate=self.negate)
 
         self.config.get_config(StreamConfig).enqueue_stream_config(0, self.stream_type)
 

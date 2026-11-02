@@ -67,6 +67,12 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool)
         read_req_config->set_ctid(stream, cthread_->getCtid());
     }
 
+    // The FilterStage is optional: a bitstream without it decodes without filter.
+    has_filter_config_ = has_config<FilterConfig>();
+    if (has_filter_config_) {
+        sel_rows_ = config<FilterConfig>()->sel_rows();
+    }
+
     // Pre-map huge pages to FPGA TLB
     auto *huge_pool = dynamic_cast<libstf::HugePageMemoryPool *>(memory_pool_.get());
     if (huge_pool) {
@@ -76,12 +82,17 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool)
     // Clear any stale buffers left enqueued in hardware from a previous run.
     mem_config_->flush_buffers();
 
-    // Stream scheduler.
+    // Stream scheduler. Every decode flow queues one entry in the column chunk config FIFO and,
+    // with the FilterStage, one in the filter config FIFO.
+    size_t max_decode_flows = cc_config->maximum_num_enqueued_configs();
+    if (has_filter_config_) {
+        max_decode_flows =
+            std::min(max_decode_flows, config<FilterConfig>()->maximum_num_enqueued_confs());
+    }
     std::vector<StreamDescription> stream_descriptions;
     stream_descriptions.reserve(mem_config_->num_streams());
     for (libstf::stream_t stream = 0; stream < cc_config->num_decoders(); ++stream) {
-        stream_descriptions.push_back({StreamCapability::DECODE,
-                                       cc_config->maximum_num_enqueued_configs(),
+        stream_descriptions.push_back({StreamCapability::DECODE, max_decode_flows,
                                        mem_config_->maximum_num_enqueued_buffers()});
     }
     if (rdma_enabled_) {

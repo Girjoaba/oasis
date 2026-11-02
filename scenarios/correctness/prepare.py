@@ -98,6 +98,21 @@ DUCKDB_FILES: Dict[str, Tuple[str, str]] = {
         FROM range({MANY_RG_ROWS}) r(i)""", f", ROW_GROUP_SIZE {RG}"),
     "e_uncompressed": ("SELECT c_id, c_int, c_bigint, c_float, c_double, c_date, c_dec18 FROM e_types",
                        ", COMPRESSION uncompressed"),
+    # Hardware filter: the types the FilterStage compares next to ones it only passes along, many
+    # row groups. c_gap has only 0 and 199 in the odd row groups, so a range inside fails every row
+    # of the group without the zone map pruning it.
+    "e_filter": (f"""
+        SELECT i::INTEGER AS c_id, (i * 31 % 1000)::INTEGER AS c_val,
+               (CASE WHEN (i // {RG}) % 2 = 1 THEN (i % 2) * 199 ELSE i % 200 END)::INTEGER AS c_gap,
+               (i::BIGINT * 1000003 - 5000000000)::BIGINT AS c_big,
+               DATE '2000-01-01' + (i % 3650)::INTEGER AS c_date,
+               ((i * 13 % 100000) / 100)::DECIMAL(9, 2) AS c_dec9,
+               ((i::BIGINT * 7919 % 10000000) / 100)::DECIMAL(18, 2) AS c_dec18,
+               (i * 0.75)::DOUBLE AS c_double, (i % 300)::SMALLINT AS c_small
+        FROM range({MANY_RG_ROWS}) r(i)""", f", ROW_GROUP_SIZE {RG}"),
+    # One row group with more rows than the selection bitmap of the FilterStage holds (2**17).
+    "e_big_rg": ("SELECT i::INTEGER AS c_id, (i * 31 % 1000)::INTEGER AS c_val FROM range(200000) r(i)",
+                 ", ROW_GROUP_SIZE 200000"),
     # Known gaps.
     "g_nulls": ("""
         SELECT i::INTEGER AS c_id,
@@ -186,6 +201,24 @@ CASES: Dict[str, str] = {
     "pa_pages": "SELECT * FROM {e_pa_pages}",
     "pa_pages_filter": "SELECT c_i32, c_f64 FROM {e_pa_pages} WHERE c_i32 BETWEEN 9990 AND 10010",
     "pa_dict": "SELECT * FROM {e_pa_dict}",
+    # Hardware filter (oasis_hw_filter): the FilterStage drops the failing rows of the row group.
+    "hwf_all_fail_group": "SELECT c_id, c_gap FROM {e_filter} WHERE c_gap BETWEEN 50 AND 150",
+    "hwf_filter_only": "SELECT c_id FROM {e_filter} WHERE c_val < 10",
+    "hwf_count": "SELECT count(*) AS n FROM {e_filter} WHERE c_val < 10",
+    "hwf_count_all_fail": "SELECT count(*) AS n FROM {e_filter} WHERE c_gap BETWEEN 50 AND 150",
+    "hwf_two_on_one": "SELECT c_id, c_val FROM {e_filter} WHERE c_val >= 100 AND c_val < 110",
+    "hwf_neq": "SELECT c_id FROM {e_filter} WHERE c_val <> 500",
+    "hwf_neq_and": "SELECT c_id FROM {e_filter} WHERE c_val <> 500 AND c_val > 100",
+    "hwf_one_sided": "SELECT c_id, c_big FROM {e_filter} WHERE c_big > 0",
+    "hwf_one_sided_lo": "SELECT c_id, c_big FROM {e_filter} WHERE c_big <= -4000000000",
+    "hwf_date": "SELECT c_id, c_date FROM {e_filter} WHERE c_date >= DATE '2005-01-01' AND c_date < DATE '2005-02-01'",
+    "hwf_decimal": "SELECT c_id, c_dec18 FROM {e_filter} WHERE c_dec9 BETWEEN 10.00 AND 20.50 AND c_dec18 < 5000",
+    "hwf_mixed": "SELECT c_id, c_big, c_val FROM {e_filter} WHERE c_val < 500 AND c_big > 1000000000",
+    "hwf_eq_first": f"SELECT c_id FROM {{e_filter}} WHERE c_id = {RG}",
+    "hwf_eq_last": f"SELECT c_id FROM {{e_filter}} WHERE c_id = {MANY_RG_ROWS - 1}",
+    "hwf_double_proj": "SELECT c_id, c_double FROM {e_filter} WHERE c_val < 10",
+    "hwf_small_proj": "SELECT c_id, c_small FROM {e_filter} WHERE c_val < 10",
+    "hwf_big_rg": "SELECT c_id FROM {e_big_rg} WHERE c_val < 5",
 }
 
 # Known gaps (extension/test/README.md, "Known gaps", and the codecs and encodings ParCore lacks).

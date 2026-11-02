@@ -7,15 +7,16 @@
 #   pipes of $WORK by its absolute path. The hosted runners have the same $HOME, $RUNNER_TEMP and
 #   checkout path in every job.
 #
-# The archive: the libraries in $OPT_SIM and $OPT/lib, coyote_vl, $WORK, the DuckDB shell, the
-# generated correctness scenarios, and sim_params.svh of the Coyote submodule (run.py checks the
-# simulator variables against it).
+# The archive: the shared libraries of $OPT_SIM and jemalloc's of $OPT/lib (the run loads only
+# these, not the static archives), coyote_vl, $WORK, the DuckDB shell, the generated correctness
+# scenarios, and sim_params.svh of the Coyote submodule (run.py checks the simulator variables
+# against it).
 set -euo pipefail
 
 . "$(dirname "$0")/sim_env.sh"
 [ $# -eq 1 ] || { echo "usage: $0 <archive.tar.gz>" >&2; exit 2; }
 
-# -h stores the targets of symbolic links: coyote_vl links into obj/, the libraries link to their versions.
-tar -czhPf "$1" "$OPT_SIM/lib" "$OPT/lib" "$VL_OUT/coyote_vl" "$WORK" "$DUCKDB" "$CORRECTNESS" \
-    "$CYT/sim/hw/sim_params.svh"
+# -h stores the targets of symbolic links: coyote_vl links into obj/.
+tar -czhPf "$1" "$OPT_SIM"/lib/*.so "$OPT"/lib/libjemalloc.so.* "$VL_OUT/coyote_vl" "$WORK" "$DUCKDB" \
+    "$CORRECTNESS" "$CYT/sim/hw/sim_params.svh"
 ls -l "$1"

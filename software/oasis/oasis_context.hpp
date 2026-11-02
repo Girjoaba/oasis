@@ -65,6 +65,25 @@ public:
     bool isRDMAEnabled() const { return rdma_enabled_; }
 
     /**
+     * Whether the hardware has a FilterStage per decoder (FilterConfig). Without it the flows can
+     * only pass every value through.
+     */
+    bool has_filter_config() const { return has_filter_config_; }
+
+    /**
+     * Rows of the selection bitmap of a FilterStage, 0 without FilterConfig. A row group with more
+     * rows cannot carry its selection across its columns in hardware.
+     */
+    size_t sel_rows() const { return sel_rows_; }
+
+    /**
+     * Whether an output stream without data takes its output buffer. The scheduler enqueues one
+     * buffer per flow, so a flow that produces no bytes (a filtered chunk without passing values)
+     * needs this to keep the buffers of the hardware and the software in step.
+     */
+    bool empty_stream_consumes_buffer() const { return mem_config_->empty_stream_consumes_buffer(); }
+
+    /**
      * Establishes one RDMA queue pair (i.e. one cThread) per hardware read-request stream with the
      * remote server, and configures each stream's ctid and remote-region base vaddr (only known
      * once its queue pair has been exchanged). A queue pair per stream keeps each stream's
@@ -116,6 +135,8 @@ private:
     std::shared_ptr<libstf::MemConfig> mem_config_;
 
     bool rdma_enabled_;
+    bool has_filter_config_ = false;
+    size_t sel_rows_ = 0;
     std::vector<std::shared_ptr<coyote::cThread>> rdma_cthreads_;
 
     std::unique_ptr<Scheduler> scheduler_;

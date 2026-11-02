@@ -65,6 +65,12 @@ class Scheduler {
     // with a future. The splinter completes (its single result channel closes) only once every flow
     // has drained. Throws if a flow requires a capability no stream provides, or could never fit
     // any providing stream's bounds.
+    //
+    // Invariant for a pinned splinter (QuerySplinter::pin_flows): its DECODE flows reach the
+    // config FIFOs of one stream contiguously and in `streams` order. The flows are pushed
+    // contiguously onto the one DECODE queue under the lock, the dispatcher alone pops its head and
+    // finishes the register writes of a flow before it pops the next, and the first flow fixes the
+    // stream for the rest. The flows of another splinter come before or after, never in between.
     SplinterResultHandle submit(QuerySplinter splinter);
 
     [[nodiscard]] libstf::stream_t num_streams() const { return num_streams_; }
@@ -116,6 +122,12 @@ class Scheduler {
         bool                                last = false;
     };
 
+    // The stream the DECODE flows of a pinned splinter (QuerySplinter::pin_flows) run on, chosen
+    // when its first flow is dispatched. Touched only by the dispatcher under dispatch_mutex_.
+    struct PinRecord {
+        std::optional<libstf::stream_t> stream;
+    };
+
     // A queued flow waiting for the dispatcher to place it on a stream providing its capability.
     // Carries the shared completion record of the splinter it belongs to and its sink's buffer
     // count (the buffer-slot dispatch gate needs it before the flow is placed).
@@ -124,6 +136,7 @@ class Scheduler {
         std::shared_ptr<SplinterCompletion> completion;
         StreamCapability                    capability  = StreamCapability::DECODE;
         size_t                              num_buffers = 0;
+        std::shared_ptr<PinRecord>          pin; // null for an unpinned flow
     };
 
     // Per-stream pipeline: The stream's bounds (from its StreamDescription), the list of in-flight
@@ -170,10 +183,11 @@ class Scheduler {
     // Returns the least-loaded stream providing `capability` that can accept a flow whose sink
     // spans `num_buffers` buffers (its flow gate and buffer gate both have room). For DECODE the
     // candidates are the active span and the flow gate is the runtime pipeline depth; for other
-    // capabilities every providing stream is a candidate, gated by its hardware bounds. nullopt if
-    // none. Must be called holding dispatch_mutex_.
-    std::optional<libstf::stream_t> pick_stream(StreamCapability capability,
-                                                size_t           num_buffers) const;
+    // capabilities every providing stream is a candidate, gated by its hardware bounds. With
+    // `pinned` the only candidate is that stream, whether it is in the active span or not. nullopt
+    // if none. Must be called holding dispatch_mutex_.
+    std::optional<libstf::stream_t> pick_stream(StreamCapability capability, size_t num_buffers,
+                                                std::optional<libstf::stream_t> pinned) const;
 
     // Applies a flow on `stream`: Records a pending completion per sink buffer and enqueues the
     // buffers to the FPGA, parking the flow in the stream's in-flight list. Called only by the

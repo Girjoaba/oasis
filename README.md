@@ -54,7 +54,7 @@ regenerated whenever new files are added (also true for the dependencies).
 network model, for example TPC-H Q6 over RDMA: `scenarios/run.py` runs one scenario file and
 writes `result.json`. See [scenarios/README.md](scenarios/README.md).
 
-The workflow `.github/workflows/simulation.yaml` runs the TPC-H Q6 under Verilator on every push, without Vivado (`scripts/ci/q6_verilator.sh`). `sim/vl/configure.sh` of the Coyote submodule configures `hardware/` with a stub Vivado, renders the Coyote templates and lists the sources and include folders of the vFPGA folders. Verilator compiles no VHDL, so `hardware/sim_models/` carries Verilog for the VHDL entities of the vFPGA: `gen_vhsnunzip.sh` converts `vhsnunzip` with GHDL on every run, and GHDL finds its files. `scripts/ci/PINS` holds the submodule commits the run checks out (`scripts/ci/pin_submodules.sh`).
+The workflow `.github/workflows/simulation.yaml` runs the correctness scenarios under Verilator on every push, without Vivado: `scripts/ci/sim_build.sh` builds once, `scripts/ci/bundle.sh` packs the build, and every scenario runs in its own job (`scripts/ci/run_scenario.sh`, see [scenarios/README.md](scenarios/README.md)). `sim/vl/configure.sh` of the Coyote submodule configures `hardware/` with a stub Vivado, renders the Coyote templates and lists the sources and include folders of the vFPGA folders. Verilator compiles no VHDL, so `hardware/sim_models/` carries Verilog for the VHDL entities of the vFPGA: `gen_vhsnunzip.sh` converts `vhsnunzip` with GHDL on every run, and GHDL finds its files. `scripts/ci/PINS` holds the submodule commits the run checks out (`scripts/ci/pin_submodules.sh`).
 
 ### Synthesis
 For synthesis, execute the following command (only tested for the build servers in the

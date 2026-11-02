@@ -132,10 +132,14 @@ SplinterResultHandle Scheduler::submit(QuerySplinter splinter) {
     // rejected splinter leaves no partial trace behind.
     std::vector<Pending> pendings;
     pendings.reserve(splinter.streams.size());
+    auto pin = splinter.pin_flows ? std::make_shared<PinRecord>() : nullptr;
     for (auto &flow : splinter.streams) {
         Pending pending;
         pending.capability = required_capability(flow);
         pending.completion = completion;
+        if (pin && pending.capability == StreamCapability::DECODE) {
+            pending.pin = pin;
+        }
         const LocalSinkOperator *sink = nullptr;
         for (const auto &op : flow) {
             if (const auto *s = dynamic_cast<const LocalSinkOperator *>(op.get())) {
@@ -180,7 +184,8 @@ SplinterResultHandle Scheduler::submit(QuerySplinter splinter) {
 }
 
 std::optional<libstf::stream_t> Scheduler::pick_stream(StreamCapability capability,
-                                                       size_t           num_buffers) const {
+                                                       size_t           num_buffers,
+                                                       std::optional<libstf::stream_t> pinned) const {
     const auto &candidates = streams_by_capability_[capability_index(capability)];
 
     // Only the DECODE streams have the runtime knobs: the active span caps the candidates and the
@@ -192,18 +197,26 @@ std::optional<libstf::stream_t> Scheduler::pick_stream(StreamCapability capabili
     }
     const size_t depth = queue_depth_.load();
 
+    // Whether the flow gate and the buffer gate (free output-writer slots) of the stream have room.
+    auto has_room = [&](libstf::stream_t s) {
+        const StreamState &ss = *streams_[s];
+        return ss.enqueued.load(std::memory_order_relaxed) < (tunable ? depth : ss.max_flows) &&
+               ss.max_buffers - ss.enqueued_buffers.load(std::memory_order_relaxed) >= num_buffers;
+    };
+
+    // A pinned splinter stays on its stream, also outside the active span.
+    if (pinned) {
+        return has_room(*pinned) ? pinned : std::nullopt;
+    }
+
     std::optional<libstf::stream_t> best;
     size_t                          best_load = 0;
     for (size_t c = 0; c < span; ++c) {
-        const libstf::stream_t s    = candidates[c];
-        const StreamState     &ss   = *streams_[s];
-        const size_t           load = ss.enqueued.load(std::memory_order_relaxed);
-        if (load >= (tunable ? depth : ss.max_flows)) {
-            continue; // Flow gate full.
+        const libstf::stream_t s = candidates[c];
+        if (!has_room(s)) {
+            continue;
         }
-        if (ss.max_buffers - ss.enqueued_buffers.load(std::memory_order_relaxed) < num_buffers) {
-            continue; // Not enough free output-writer (buffer) slots.
-        }
+        const size_t load = streams_[s]->enqueued.load(std::memory_order_relaxed);
         if (!best || load < best_load) {
             best      = s;
             best_load = load;
@@ -248,7 +261,9 @@ void Scheduler::dispatch_loop() {
             if (queues_[c].empty()) {
                 continue;
             }
-            stream = pick_stream(static_cast<StreamCapability>(c), queues_[c].front().num_buffers);
+            const Pending &head = queues_[c].front();
+            stream    = pick_stream(static_cast<StreamCapability>(c), head.num_buffers,
+                                    head.pin ? head.pin->stream : std::nullopt);
             queue_idx = c;
         }
 
@@ -273,6 +288,10 @@ void Scheduler::dispatch_loop() {
         streams_[*stream]->enqueued.fetch_add(1, std::memory_order_relaxed);
         streams_[*stream]->enqueued_buffers.fetch_add(pending.num_buffers,
                                                       std::memory_order_relaxed);
+        if (pending.pin) {
+            // The first flow of a pinned splinter fixes the stream of the others (see submit).
+            pending.pin->stream = *stream;
+        }
 
         lock.unlock();
         dispatch_to(*stream, pending);

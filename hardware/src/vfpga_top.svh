@@ -25,10 +25,11 @@ end
 
 localparam NUM_STREAMS        = N_STRM_AXI;
 localparam DATABEAT_SIZE      = AXI_DATA_BITS / 8;
-// MemConfig write side needs NUM_STREAMS+1 regs, read side needs 3 (ID, num_streams, max_enqueued).
-localparam MEM_CONFIG_NUM_REGS = (NUM_STREAMS + 1 > 3) ? NUM_STREAMS + 1 : 3;
+// MemConfig write side needs NUM_STREAMS+1 regs, read side needs 4 (ID, num_streams, max_enqueued,
+// empty_stream_consumes_buffer).
+localparam MEM_CONFIG_NUM_REGS = (NUM_STREAMS + 1 > 4) ? NUM_STREAMS + 1 : 4;
 
-localparam NUM_CONFIGS   = 3;
+localparam NUM_CONFIGS   = 4;
 `ifdef EN_RDMA
 localparam NUM_DECODERS  = NUM_STREAMS - 1;
 `else
@@ -49,6 +50,7 @@ mem_config_i                         mem_conf[NUM_STREAMS](.*);
 ready_valid_i #(read_req_t)          read_conf[NUM_STREAMS](.*);
 logic [PID_BITS-1:0]                 read_ctid[NUM_STREAMS];
 ready_valid_i #(column_chunk_conf_t) column_chunk_conf[NUM_DECODERS](.*);
+ready_valid_i #(filter_conf_t)       filter_conf[NUM_DECODERS](.*);
 decoder_profile_i                    decoder_profiles[NUM_DECODERS]();
 
 GlobalConfig #(
@@ -57,7 +59,8 @@ GlobalConfig #(
     .ADDR_SPACE_SIZES({
         MEM_CONFIG_NUM_REGS,
         COLUMN_CHUNK_DECODER_READ_REGS(NUM_DECODERS),
-        NUM_READ_REQ_CONFIG_REGS * NUM_STREAMS
+        NUM_READ_REQ_CONFIG_REGS * NUM_STREAMS,
+        FILTER_CONFIG_REGS(NUM_DECODERS)
     }),
     .READ_CONFIG_SKID_DEPTH(2)
 ) inst_config (
@@ -70,8 +73,11 @@ GlobalConfig #(
     .read_configs(read_configs)
 );
 
+// A filtered column chunk without passing values is an empty stream. It has to take its buffer, so
+// that the buffers stay one per column chunk, as the scheduler enqueues them.
 MemConfig #(
-    .NUM_STREAMS(NUM_STREAMS)
+    .NUM_STREAMS(NUM_STREAMS),
+    .EMPTY_STREAM_CONSUMES_BUFFER(1)
 ) inst_mem_config (
     .clk(clk),
     .rst_n(rst_n),
@@ -107,6 +113,18 @@ ReadReqConfig #(
 
     .out(read_conf),
     .ctid(read_ctid)
+);
+
+FilterConfig #(
+    .NUM_DECODERS(NUM_DECODERS)
+) inst_filter_config (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .write_config(write_configs[3]),
+    .read_config(read_configs[3]),
+
+    .out(filter_conf)
 );
 
 // -- Arbiter the read send queue ------------------------------------------------------------------
@@ -183,8 +201,18 @@ for (genvar I = 0; I < NUM_DECODERS; I++) begin : gen_decoders
         .profile(decoder_profiles[I])
     );
 
-    // Discard typed
-    `DATA_ASSIGN(typed_out, out);
+    // Filters the values and drops the type
+    FilterStage #(
+        .DATABEAT_SIZE(DATABEAT_SIZE)
+    ) inst_filter_stage (
+        .clk(clk),
+        .rst_n(rst_n),
+
+        .conf(filter_conf[I]),
+
+        .in(typed_out),
+        .out(out)
+    );
 
     NDataToAXI #(data8_t, DATABEAT_SIZE) inst_ndata_to_axi (
         .clk(clk),

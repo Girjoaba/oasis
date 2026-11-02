@@ -1,6 +1,7 @@
 #pragma once
 
 #include "libstf/common.hpp"
+#include "oasis/operator.hpp"
 #include <coyote/cThread.hpp>
 #include <libstf/configuration.hpp>
 #include <parcore/configuration.hpp>
@@ -52,6 +53,50 @@ class ReadReqConfig : public libstf::Config {
   private:
     libstf::stream_t       num_streams_;
     std::vector<uintptr_t> base_vaddrs_;
+};
+
+// Per-decoder write registers: [0] lo, [1] hi, [2] ctrl. Read registers: [0] ID, [1] number of
+// decoders, [2] FIFO depth, [3] rows of the selection bitmap.
+constexpr const uint64_t FILTER_CONFIG_REGS = 3;
+constexpr const uint64_t FILTER_CONFIG_ID   = 0x14e8418192d46a72;
+
+// The bits of the ctrl register, filter_ctrl_t in hardware/src/hdl/common.sv.
+constexpr const uint64_t FILTER_CTRL_EMIT      = 1u << 0;
+constexpr const uint64_t FILTER_CTRL_STORE_SEL = 1u << 1;
+constexpr const uint64_t FILTER_CTRL_LOAD_SEL  = 1u << 2;
+constexpr const uint64_t FILTER_CTRL_NEGATE    = 1u << 3;
+constexpr const uint64_t FILTER_CTRL_COMPARE   = 1u << 4;
+
+/**
+ * Configures the FilterStage of each decoder: one FilterSpec per column chunk.
+ */
+class FilterConfig : public libstf::Config {
+  public:
+    FilterConfig(std::shared_ptr<coyote::cThread> cthread, uint32_t addr_offset,
+                 uint32_t num_regs);
+
+    /**
+     * Queues the FilterSpec of the next column chunk of `decoder`. The hardware pairs it with the
+     * next column chunk configuration of the decoder, so write exactly one per column chunk, before
+     * the column chunk configuration (DecodeColumnChunkOperator::apply does both).
+     */
+    void enqueue(libstf::stream_t decoder, const FilterSpec &spec);
+
+    const libstf::stream_t num_decoders() const;
+    const size_t           maximum_num_enqueued_confs() const;
+
+    /**
+     * Rows of the selection bitmap of a decoder: the largest row group whose selection the
+     * FilterStage can carry across the columns.
+     */
+    const size_t sel_rows() const;
+
+    static constexpr uint64_t ID = FILTER_CONFIG_ID;
+
+  private:
+    libstf::stream_t num_decoders_;
+    size_t           maximum_num_enqueued_confs_;
+    size_t           sel_rows_;
 };
 
 // GenericConfig read side: local address 0 is the config ID, 1 the OutputWriter notify counter,

@@ -31,7 +31,6 @@ assign rst_n = aresetn;
 AXI4S axi_host_recv_0(.aclk(clk), .aresetn(rst_n));
 
 typed_ndata_i #(DATABEAT_SIZE) in(clk, rst_n);
-typed_ndata_i #(DATABEAT_SIZE) compared(clk, rst_n);
 logic[DATABEAT_SIZE / 4 - 1:0] pass;
 
 typed_ndata_i #(DATABEAT_SIZE) values(clk, rst_n);
@@ -45,7 +44,7 @@ read_config_i  read_configs [2](clk, rst_n);
 GlobalConfig #(
     .SYSTEM_ID(OASIS_SYSTEM_ID),
     .NUM_CONFIGS(2),
-    .ADDR_SPACE_SIZES({2, NUM_FILTER_COMPARE_CONFIG_REGS})
+    .ADDR_SPACE_SIZES({2, FILTER_CONFIG_REGS(1)})
 ) inst_config (
     .clk(clk),
     .rst_n(rst_n),
@@ -74,18 +73,30 @@ ready_valid_i #(type_t) data_type(clk, rst_n);
 
 assign stream_config[0].select_ready = 1'b1;
 
-filter_bounds_t bounds[1];
-FilterCompareConfig #(
+// The bounds of the test come from the first conf of the FilterConfig and hold for the whole test
+ready_valid_i #(filter_conf_t) filter_conf[1](clk, rst_n);
+FilterConfig #(
     .NUM_DECODERS(1)
-) inst_filter_compare_config (
+) inst_filter_config (
     .clk(clk),
     .rst_n(rst_n),
 
     .write_config(write_configs[1]),
     .read_config(read_configs[1]),
 
-    .bounds(bounds)
+    .out(filter_conf)
 );
+
+filter_conf_t conf;
+assign filter_conf[0].ready = 1'b1;
+
+always_ff @(posedge clk) begin
+    if (!rst_n) begin
+        conf <= '0;
+    end else if (filter_conf[0].valid) begin
+        conf <= filter_conf[0].data;
+    end
+end
 
 // -- Input ----------------------------------------------------------------------------------------
 `AXIS_ASSIGN(axis_host_recv[0], axi_host_recv_0) // AXI4SR to AXI4S
@@ -108,10 +119,12 @@ FilterCompare #(
     .clk(clk),
     .rst_n(rst_n),
 
-    .bounds(bounds[0]),
+    .conf(conf),
 
-    .in(in),
-    .out(compared),
+    .data(in.data),
+    .keep(in.keep),
+    .typ(in.typ),
+    .valid(in.valid),
     .pass(pass)
 );
 
@@ -129,13 +142,13 @@ typedef struct packed {
 ready_valid_i #(beat_t) beat(clk, rst_n);
 ready_valid_i #(beat_t) beat_dup[2](clk, rst_n);
 
-assign beat.data.data = compared.data;
-assign beat.data.typ  = compared.typ;
-assign beat.data.keep = compared.keep;
-assign beat.data.last = compared.last;
+assign beat.data.data = in.data;
+assign beat.data.typ  = in.typ;
+assign beat.data.keep = in.keep;
+assign beat.data.last = in.last;
 assign beat.data.pass = pass;
-assign beat.valid     = compared.valid;
-assign compared.ready = beat.ready;
+assign beat.valid     = in.valid;
+assign in.ready       = beat.ready;
 
 ReadyValidDuplicator #(2) inst_beat_duplicate (
     .clk(clk),

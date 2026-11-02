@@ -76,15 +76,43 @@ class LocalSourceOperator final : public SourceOperator {
 };
 
 /**
+ * What the FilterStage of the decoder does with one column chunk (filter_conf_t in hardware). A
+ * value passes if lo <= x <= hi (signed, on the type the decoder emits; INT32 compares the low 32
+ * bits), or if not with negate. Without compare every value passes. load_sel ANDs the selection
+ * bitmap of the decoder (the pass bits of the previous filter columns of the row group) into the
+ * pass bits, store_sel writes the result back. Without emit the output of the chunk is empty.
+ *
+ * The default is a chunk without filter: every value is written to the host.
+ */
+struct FilterSpec {
+    bool    compare   = false;
+    bool    negate    = false;
+    bool    load_sel  = false;
+    bool    store_sel = false;
+    bool    emit      = true;
+    int64_t lo        = std::numeric_limits<int64_t>::min();
+    int64_t hi        = std::numeric_limits<int64_t>::max();
+
+    [[nodiscard]] bool is_passthrough() const {
+        return !compare && !load_sel && !store_sel && emit;
+    }
+};
+
+std::ostream &operator<<(std::ostream &os, const FilterSpec &spec);
+
+/**
  * Programs the configuration (compression, value count, physical type, whether the column is
- * REQUIRED, logical type) via ColumnChunkDecoderConfig::enqueue_column_chunk.
+ * REQUIRED, logical type) via ColumnChunkDecoderConfig::enqueue_column_chunk, preceded by the
+ * FilterSpec of the chunk via FilterConfig::enqueue. The hardware pairs the two in order, so every
+ * decode flow writes exactly one filter conf.
  */
 class DecodeColumnChunkOperator final : public Operator {
   public:
     DecodeColumnChunkOperator(parcore::metadata::Compression compression, uint64_t num_values,
-                              libstf::type_t type, bool is_required, libstf::type_t logical_type)
+                              libstf::type_t type, bool is_required, libstf::type_t logical_type,
+                              FilterSpec filter = {})
         : compression_(compression), num_values_(num_values), type_(type),
-          is_required_(is_required), logical_type_(logical_type) {}
+          is_required_(is_required), logical_type_(logical_type), filter_(filter) {}
 
     void apply(libstf::stream_t stream, OasisContext &ctx) override;
     void print(std::ostream &os) const override;
@@ -95,6 +123,7 @@ class DecodeColumnChunkOperator final : public Operator {
     libstf::type_t                 type_;
     bool                           is_required_;
     libstf::type_t                 logical_type_;
+    FilterSpec                     filter_;
 };
 
 /**

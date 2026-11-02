@@ -24,10 +24,12 @@
 #include "rdma_file_system.hpp"
 #include "reader/struct_column_reader.hpp"
 #include "filter_pushdown.hpp"
+#include "hw_filter.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <numeric>
 #include <string>
 #include <utility>
 #include <vector>
@@ -209,6 +211,10 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	context.TryGetCurrentSetting("oasis_narrow_transfer", narrow_val);
 	gstate->narrow_transfer = !narrow_val.IsNull() && narrow_val.GetValue<bool>();
 
+	Value hw_filter_val;
+	context.TryGetCurrentSetting("oasis_hw_filter", hw_filter_val);
+	const bool hw_filter_setting = hw_filter_val.IsNull() || hw_filter_val.GetValue<bool>();
+
 	for (auto col_id : input.column_ids) {
 		const auto &chunk = bind_data.metadata.groups[0].chunks[col_id];
 		if (parcore::metadata::is_libstf_type(chunk.type)) {
@@ -239,6 +245,20 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 			// CPU path: Variable-length type (BYTE_ARRAY/string) decoded by DuckDB's ColumnReader.
 			gstate->projected_columns.push_back({col_id, 0, true});
 			gstate->has_cpu_columns = true;
+		}
+	}
+
+	// Hardware filtering needs the FilterStage, buffers that an empty output consumes (a filtered
+	// chunk may produce no bytes) and no CPU column, which would need the selection on the host.
+	if (hw_filter_setting && input.filters && input.filters->HasFilters()) {
+		if (!ctx.has_filter_config()) {
+			DUCKDB_LOG_DEBUG(context, "Hardware filter off: the bitstream has no FilterStage.");
+		} else if (!ctx.empty_stream_consumes_buffer()) {
+			DUCKDB_LOG_DEBUG(context, "Hardware filter off: an empty output stream keeps its buffer.");
+		} else if (gstate->has_cpu_columns) {
+			DUCKDB_LOG_DEBUG(context, "Hardware filter off: the scan has CPU (string) columns.");
+		} else {
+			gstate->hw_filter = true;
 		}
 	}
 
@@ -332,6 +352,9 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
 	// owned by this worker), splitting top-level ANDs into per-conjunct filters (BuildScanFilters).
 	if (gstate.filters) {
 		BuildScanFilters(context.client, *gstate.filters, gstate, bind_data, lstate->scan_filters);
+		if (gstate.hw_filter) {
+			ClassifyHardwareFilters(context.client, gstate, bind_data, lstate->scan_filters);
+		}
 	}
 
 	return std::move(lstate);
@@ -405,7 +428,7 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 
 		// Enforce the one-buffer-per-chunk invariant: the decoded output must fit in a single FPGA
 		// output buffer. num_values is the row count, the element width is the transfer width.
-		const size_t decoded_size = cc.num_values * (pending.narrowed[i] ? sizeof(int32_t) : col.elem_size);
+		const size_t decoded_size = cc.num_values * col.TransferSize(pending.narrowed[i]);
 		if (decoded_size > libstf::MAXIMUM_OUTPUT_WRITER_BUFFER_SIZE) {
 			throw NotImplementedException(
 			    "Column '%s' row group %llu decodes to %llu bytes, exceeding the %llu byte maximum "
@@ -449,14 +472,26 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 		                 (unsigned long long)pending.fetcher->bytes_fetched(), (unsigned long long)group);
 	}
 
+	// Hardware filtering of the group: the FilterSpec and the dispatch order of the chunks. The
+	// filter columns go first and pass their selection to the others through the decoder, so the
+	// splinter's flows are pinned to one decoder.
+	if (!PlanHardwareFilter(context, gstate, lstate, bind, pending)) {
+		pending.order.resize(pending.hw_slot.size());
+		std::iota(pending.order.begin(), pending.order.end(), 0);
+		pending.specs.assign(pending.hw_slot.size(), oasis::FilterSpec {});
+		pending.hw_emit.assign(gstate.projected_columns.size(), true);
+	}
+
 	// Build the QuerySplinter for the whole row group -- one decode flow per hardware column, one
 	// raw bypass flow per CPU column (RDMA only). The scheduler capability-matches and
 	// load-balances the flows across the hardware streams and closes the handle once all finish.
 	oasis::QuerySplinter splinter;
 	splinter.streams.reserve(pending.hw_slot.size() + pending.cpu_slot.size());
-	for (size_t k = 0; k < pending.hw_slot.size(); k++) {
+	splinter.pin_flows = pending.hw_filtered;
+	for (size_t k : pending.order) {
 		const auto &cc = *pending.hw_chunks[k];
 		const auto &col = gstate.projected_columns[pending.hw_slot[k]];
+		const auto &spec = pending.specs[k];
 		auto type = parcore::metadata::to_libstf_type(cc.type);
 		auto logical_type =
 		    pending.narrowed[pending.hw_slot[k]] ? libstf::type_t::INT32_T : col.cast_type.value_or(cc.logical_type());
@@ -468,8 +503,9 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 			flow.push_back(MakeHostSource(pending.fetcher->Resolve(pending.host_handles[k])));
 		}
 		flow.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type,
-		                                                                   cc.is_required, logical_type));
-		auto sink_buffer = ctx.allocate_output_buffer(cc.num_values * libstf::size_of(logical_type));
+		                                                                   cc.is_required, logical_type, spec));
+		// A chunk the hardware does not emit still takes one (minimal) buffer
+		auto sink_buffer = ctx.allocate_output_buffer(spec.emit ? cc.num_values * libstf::size_of(logical_type) : 0);
 		flow.push_back(std::make_unique<oasis::LocalSinkOperator>(std::move(sink_buffer), pending.hw_slot[k]));
 		splinter.streams.push_back(std::move(flow));
 	}
@@ -637,6 +673,32 @@ static void TopUpPrefetch(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	}
 }
 
+// The rows of a hardware-filtered group: the bytes the hardware wrote for the first emitted column
+// (every emitted column has the same rows) divided by its element size. Checks that the hardware
+// wrote nothing for the columns it does not emit and whole elements for that column.
+static size_t HardwareFilteredRows(const OasisScanGlobalState &gstate, const OasisScanLocalState::PendingGroup &head) {
+	for (size_t i = 0; i < gstate.projected_columns.size(); i++) {
+		const auto &col = gstate.projected_columns[i];
+		if (col.is_cpu || head.hw_emit[i] || !head.hw_buffers[i]) {
+			continue;
+		}
+		if (head.hw_buffers[i]->size != 0) {
+			throw InternalException("Row group %llu: the hardware wrote %llu bytes for column %llu it does not emit",
+			                        (unsigned long long)head.group, (unsigned long long)head.hw_buffers[i]->size,
+			                        (unsigned long long)i);
+		}
+	}
+	const size_t carrier = std::find(head.hw_emit.begin(), head.hw_emit.end(), true) - head.hw_emit.begin();
+	D_ASSERT(carrier < head.hw_emit.size()); // PlanHardwareFilter emits at least one column
+	const size_t transfer_size = gstate.projected_columns[carrier].TransferSize(head.narrowed[carrier]);
+	const size_t bytes = head.hw_buffers[carrier]->size;
+	if (bytes % transfer_size != 0) {
+		throw InternalException("Row group %llu: the hardware wrote %llu bytes for column %llu, not whole elements",
+		                        (unsigned long long)head.group, (unsigned long long)bytes, (unsigned long long)carrier);
+	}
+	return bytes / transfer_size;
+}
+
 static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
                                OasisScanLocalState &lstate, const OasisScanBindData &bind,
                                std::vector<unique_ptr<AsyncTask>> &out_tasks) {
@@ -669,11 +731,22 @@ static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx,
 		}
 	}
 
+	// A hardware-filtered group has the rows the hardware kept. A group without any loads with 0
+	// rows, and EmitOneSlice goes on to the next one.
+	size_t num_rows = head.num_rows;
+	if (head.hw_filtered) {
+		num_rows = HardwareFilteredRows(gstate, head);
+		lstate.hw_filter_rows_out += num_rows;
+		DUCKDB_LOG_DEBUG(context, "Row group %llu: %llu of %llu rows pass the hardware filter",
+		                 (unsigned long long)head.group, (unsigned long long)num_rows, (unsigned long long)head.num_rows);
+	}
+
 	lstate.current_buffers = std::move(head.hw_buffers);
 	lstate.current_narrowed = std::move(head.narrowed);
 	lstate.current_needs_row_filter = std::move(head.needs_row_filter);
+	lstate.current_hw_emit = std::move(head.hw_emit);
 	lstate.current_buf_offset = 0;
-	lstate.current_group_num_rows = head.num_rows;
+	lstate.current_group_num_rows = num_rows;
 	lstate.current_group = head.group;
 
 	// For RDMA, stage the splinter-fetched CPU column bytes on the handle the thrift transport
@@ -716,8 +789,9 @@ struct SliceResult {
 static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
                                 OasisScanLocalState &lstate, const OasisScanBindData &bind, DataChunk &output,
                                 std::vector<unique_ptr<AsyncTask>> &out_tasks) {
-	// When the current group is fully emitted, decode/claim the next one.
-	if (lstate.current_group_num_rows == 0) {
+	// When the current group is fully emitted, decode/claim the next one. A hardware-filtered group
+	// without a passing row loads with 0 rows and is passed over.
+	while (lstate.current_group_num_rows == 0) {
 		auto load = GetNextGroup(context, ctx, gstate, lstate, bind, out_tasks);
 		if (load != LoadResult::LOADED) {
 			return {0, load}; // BLOCKED or EXHAUSTED.
@@ -741,9 +815,13 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 			continue; // Decoded by DecodeAndFilterSlice below.
 		}
 
+		if (!lstate.current_hw_emit[i]) {
+			continue; // The hardware filtered on this column and wrote nothing. Its filters are done.
+		}
+
 		auto &buf = lstate.current_buffers[i];
 		const bool narrowed = lstate.current_narrowed[i];
-		const size_t transfer_size = narrowed ? sizeof(int32_t) : col.elem_size;
+		const size_t transfer_size = col.TransferSize(narrowed);
 		if (buf->size / transfer_size != total_elements) {
 			throw InternalException(
 			    "ParCore buffer layout mismatch across columns: column %llu has %llu elements, expected %llu",
@@ -906,8 +984,14 @@ void OasisScanGetMetrics(TableFunctionGetMetricsInput &input) {
 		auto &lstate = input.local_state->Cast<OasisScanLocalState>();
 		gstate.filter_time_ns += lstate.filter_time_ns;
 		gstate.string_decode_time_ns += lstate.string_decode_time_ns;
+		gstate.hw_filter_groups += lstate.hw_filter_groups;
+		gstate.hw_filter_rows_in += lstate.hw_filter_rows_in;
+		gstate.hw_filter_rows_out += lstate.hw_filter_rows_out;
 		lstate.filter_time_ns = 0;
 		lstate.string_decode_time_ns = 0;
+		lstate.hw_filter_groups = 0;
+		lstate.hw_filter_rows_in = 0;
+		lstate.hw_filter_rows_out = 0;
 	}
 
 	// Sums over all workers, so they can exceed the operator's wall-clock time.
@@ -917,6 +1001,11 @@ void OasisScanGetMetrics(TableFunctionGetMetricsInput &input) {
 	}
 	if (gstate.has_cpu_columns) {
 		input.operator_metrics.AddExtraInfo("String Decode Time", seconds(gstate.string_decode_time_ns.load()));
+	}
+	if (gstate.hw_filter) {
+		input.operator_metrics.AddExtraInfo("HW Filter Groups", std::to_string(gstate.hw_filter_groups.load()));
+		input.operator_metrics.AddExtraInfo("HW Filter Rows In", std::to_string(gstate.hw_filter_rows_in.load()));
+		input.operator_metrics.AddExtraInfo("HW Filter Rows Out", std::to_string(gstate.hw_filter_rows_out.load()));
 	}
 }
 
