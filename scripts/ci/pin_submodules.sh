@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
-# Check out the submodule commits of scripts/ci/PINS, fetched from the forks that hold them.
+# Check out the submodule commits of scripts/ci/PINS, fetched from the repositories that hold them.
 #
 # Usage: scripts/ci/pin_submodules.sh
 #   scripts/ci/PINS holds one `submodule: <path> <commit>` line per submodule (scripts/ci/record_pins.sh)
 #
-# Oasis pins parcore, parcore pins libstf and libstf pins Coyote, all at upstream commits. The
-# Verilator fixes sit on fork branches until the pull requests merge, so a plain submodule checkout
-# gives sources that Verilator refuses. This script moves the three nested checkouts to the recorded
-# commits, top-down, and stops with exit 1 when a recorded commit does not contain the commit that the
-# parent tree pins: then the pin moved after the record, and record_pins.sh must run again.
+# Oasis pins parcore, parcore pins libstf and libstf pins Coyote. parcore pins a libstf without the
+# Verilator fixes (libstf#33), and the Verilator simulation of Coyote sits on a fork branch, so a plain
+# submodule checkout gives sources that Verilator refuses. This script moves the three nested checkouts
+# to the recorded commits, top-down, and stops with exit 1 when a recorded commit does not contain the
+# commit that the parent tree pins: then the pin moved after the record, and record_pins.sh must run again.
 #
-# Environment: FORK_PARCORE, FORK_LIBSTF, FORK_COYOTE, the repositories that hold the recorded
-# commits (default: the Girjoaba forks on GitHub).
+# Environment: PARCORE_URL, LIBSTF_URL, COYOTE_URL, the repositories that hold the recorded commits
+# (default: upstream parcore and libstf, the Girjoaba fork of Coyote on GitHub).
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 PINS=scripts/ci/PINS
 [ -f "$PINS" ] || { echo "$PINS missing" >&2; exit 1; }
-: "${FORK_PARCORE:=https://github.com/Girjoaba/parcore.git}"
-: "${FORK_LIBSTF:=https://github.com/Girjoaba/libstf.git}"
-: "${FORK_COYOTE:=https://github.com/Girjoaba/Coyote.git}"
+: "${PARCORE_URL:=https://github.com/celeris-labs/parcore.git}"
+: "${LIBSTF_URL:=https://github.com/fpgasystems/libstf.git}"
+: "${COYOTE_URL:=https://github.com/Girjoaba/Coyote.git}"
 
 pin() {
     local path=$1 url=$2 sha recorded
@@ -28,7 +28,7 @@ pin() {
     [ -d "$path/.git" ] || [ -f "$path/.git" ] || { echo "$path is not initialized" >&2; exit 1; }
     # The commit the parent tree pins; read after the parent was moved, so it is the pin of the recorded parent.
     recorded=$(git -C "$(dirname "$path")" ls-tree HEAD "$(basename "$path")" | awk '{print $3}')
-    # A shallow clone may already hold the commit without its history (the fork's default branch), so
+    # A shallow clone may already hold the commit without its history (the tip of the default branch), so
     # the fetch is skipped only when the history between the two commits is there.
     if ! git -C "$path" merge-base --is-ancestor "$recorded" "$sha" 2> /dev/null; then
         git -C "$path" fetch -q --depth 50 "$url" "$sha"
@@ -42,6 +42,6 @@ pin() {
     echo "$path: $sha (contains the pin $recorded)"
 }
 
-pin parcore "$FORK_PARCORE"
-pin parcore/libstf "$FORK_LIBSTF"
-pin parcore/libstf/coyote "$FORK_COYOTE"
+pin parcore "$PARCORE_URL"
+pin parcore/libstf "$LIBSTF_URL"
+pin parcore/libstf/coyote "$COYOTE_URL"
