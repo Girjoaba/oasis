@@ -219,6 +219,36 @@ CASES: Dict[str, str] = {
     "hwf_double_proj": "SELECT c_id, c_double FROM {e_filter} WHERE c_val < 10",
     "hwf_small_proj": "SELECT c_id, c_small FROM {e_filter} WHERE c_val < 10",
     "hwf_big_rg": "SELECT c_id FROM {e_big_rg} WHERE c_val < 5",
+    # Bounds from a hash join: the build side filters a column that is not a key, so the optimizer
+    # cannot derive the keys. One build key: an equality filter on the probe side.
+    "hwf_join_one_key_i32": """SELECT a.c_id, a.c_val FROM {e_filter} a
+                               JOIN (SELECT c_id FROM {e_filter} WHERE c_big = 2777023331) b ON a.c_id = b.c_id""",
+    "hwf_join_one_key_i64": """SELECT a.c_id, a.c_big FROM {e_filter} a
+                               JOIN (SELECT c_big FROM {e_filter} WHERE c_id = 7777) b ON a.c_big = b.c_big""",
+    # Two keys (no prefix range or bloom filter): optional min/max on both, rows 4000 to 4200.
+    "hwf_join_minmax": """SELECT a.c_id, a.c_big FROM {e_filter} a
+                          JOIN (SELECT c_id, c_big FROM {e_filter} WHERE c_double BETWEEN 3000 AND 3150) b
+                          ON a.c_id = b.c_id AND a.c_big = b.c_big""",
+    # Keys from 100 up: the bounds keep 95 % of the first row group, which stays on the CPU.
+    "hwf_join_minmax_wide": """SELECT a.c_id, a.c_big FROM {e_filter} a
+                               JOIN (SELECT c_id, c_big FROM {e_filter} WHERE c_double >= 75) b
+                               ON a.c_id = b.c_id AND a.c_big = b.c_big""",
+    # A constant on a filter-only column, the optional bounds ride along.
+    "hwf_join_minmax_const": """SELECT a.c_id, a.c_big FROM {e_filter} a
+                                JOIN (SELECT c_id, c_big FROM {e_filter} WHERE c_double BETWEEN 3000 AND 3150) b
+                                ON a.c_id = b.c_id AND a.c_big = b.c_big WHERE a.c_val < 500""",
+    # A constant on a projected column: it is compared in place of the optional bounds.
+    "hwf_join_required_wins": """SELECT a.c_id, a.c_val, a.c_big FROM {e_filter} a
+                                 JOIN (SELECT c_id, c_big FROM {e_filter} WHERE c_double BETWEEN 3000 AND 3150) b
+                                 ON a.c_id = b.c_id AND a.c_big = b.c_big WHERE a.c_val < 500""",
+    # The bounds and a constant on the same key intersect.
+    "hwf_join_and_const": """SELECT a.c_id, a.c_big FROM {e_filter} a
+                             JOIN (SELECT c_id, c_big FROM {e_filter} WHERE c_double BETWEEN 3000 AND 3150) b
+                             ON a.c_id = b.c_id AND a.c_big = b.c_big WHERE a.c_id >= 4100""",
+    # A range join pushes a selectivity-optional bound (c_id <= 4200).
+    "hwf_join_ineq": """SELECT a.c_id, count(*) AS n FROM {e_filter} a
+                        JOIN (SELECT c_id FROM {e_filter} WHERE c_double BETWEEN 3000 AND 3150) b ON a.c_id < b.c_id
+                        GROUP BY a.c_id""",
 }
 
 # Known gaps (extension/test/README.md, "Known gaps", and the codecs and encodings ParCore lacks).

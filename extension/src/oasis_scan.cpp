@@ -250,7 +250,9 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 
 	// Hardware filtering needs the FilterStage, buffers that an empty output consumes (a filtered
 	// chunk may produce no bytes) and no CPU column, which would need the selection on the host.
-	if (hw_filter_setting && input.filters && input.filters->HasFilters()) {
+	// Not gated on the filters of the plan: the join filters arrive with the dynamic filter merge
+	// (OasisScanInitLocal), and a group without a filter the hardware takes stays on the CPU path.
+	if (hw_filter_setting) {
 		if (!ctx.has_filter_config()) {
 			DUCKDB_LOG_DEBUG(context, "Hardware filter off: the bitstream has no FilterStage.");
 		} else if (!ctx.empty_stream_consumes_buffer()) {
@@ -1002,7 +1004,7 @@ void OasisScanGetMetrics(TableFunctionGetMetricsInput &input) {
 	if (gstate.has_cpu_columns) {
 		input.operator_metrics.AddExtraInfo("String Decode Time", seconds(gstate.string_decode_time_ns.load()));
 	}
-	if (gstate.hw_filter) {
+	if (gstate.hw_filter && gstate.filters) {
 		input.operator_metrics.AddExtraInfo("HW Filter Groups", std::to_string(gstate.hw_filter_groups.load()));
 		input.operator_metrics.AddExtraInfo("HW Filter Rows In", std::to_string(gstate.hw_filter_rows_in.load()));
 		input.operator_metrics.AddExtraInfo("HW Filter Rows Out", std::to_string(gstate.hw_filter_rows_out.load()));

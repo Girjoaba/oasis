@@ -9,6 +9,7 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/table_filter_functions.hpp"
+#include "duckdb/storage/statistics/numeric_stats.hpp"
 #include "parquet_reader.hpp"
 
 #include <algorithm>
@@ -109,31 +110,14 @@ static std::optional<int64_t> StoredConstant(const Expression &constant, const L
 	return StoredValue(value);
 }
 
-// The interval of a scan filter on a hardware column, or nullopt if the filter stays on the CPU: not
-// a comparison of the column with a constant (dynamic join filters, IN, OR, LIKE), a type the
-// hardware does not compare, or a column a pushed cast narrowed. Independent of the row group.
-static std::optional<HwInterval> TryHardwareInterval(const OasisScanFilter &filter, const ProjectedColumn &col,
-                                                     const LogicalType &scan_type, libstf::type_t transfer_type) {
-	// A column a cast narrowed, or a filter rebound to the narrow type, keeps its filters on the CPU
-	if (col.cast_type || filter.row_filter || !filter.prune_on_stats) {
-		return std::nullopt;
-	}
-	if (!HwFilterCompareType(transfer_type)) {
-		return std::nullopt;
-	}
-	if (filter.filter.filter_type != TableFilterType::EXPRESSION_FILTER) {
-		return std::nullopt;
-	}
-	auto &expr_filter = filter.filter.Cast<ExpressionFilter>();
-	if (!expr_filter.column_indexes.empty() || !expr_filter.expr) {
-		return std::nullopt; // Multi-column filter
-	}
-	const auto &expr = *expr_filter.expr;
+// The interval of a comparison of the column with a constant (also BETWEEN), or nullopt for any other
+// expression.
+static std::optional<HwInterval> ConstantInterval(const Expression &expr, const LogicalType &scan_type) {
 	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
 		return std::nullopt;
 	}
 	auto &func = expr.Cast<BoundFunctionExpression>();
-	// The dynamic, optional, bloom and prefix range filters of the joins
+	// The dynamic, bloom and prefix range filters of the joins
 	if (TableFilterFunctions::IsTableFilterFunction(func.Function())) {
 		return std::nullopt;
 	}
@@ -169,6 +153,39 @@ static std::optional<HwInterval> TryHardwareInterval(const OasisScanFilter &filt
 	return std::nullopt;
 }
 
+// Fills hw_interval and hw_optional of a scan filter on a hardware column. The hardware takes a
+// comparison of the column with a constant: a constant filter of the query, the one-key equality of a
+// hash join, and the min/max bounds of a hash join, which come as an optional or selectivity-optional
+// filter around such a comparison. Everything else stays on the CPU: the dynamic (top-N), bloom and
+// prefix range filters, IN, OR, LIKE, a type the hardware does not compare and a column a pushed cast
+// narrowed. Independent of the row group.
+static void ClassifyHardwareFilter(OasisScanFilter &filter, const ProjectedColumn &col, const LogicalType &scan_type,
+                                   libstf::type_t transfer_type) {
+	// A column a cast narrowed, or a filter rebound to the narrow type, keeps its filters on the CPU
+	if (col.cast_type || filter.row_filter || !filter.prune_on_stats) {
+		return;
+	}
+	if (!HwFilterCompareType(transfer_type)) {
+		return;
+	}
+	if (filter.filter.filter_type != TableFilterType::EXPRESSION_FILTER) {
+		return;
+	}
+	auto &expr_filter = filter.filter.Cast<ExpressionFilter>();
+	if (!expr_filter.column_indexes.empty() || !expr_filter.expr) {
+		return; // Multi-column filter
+	}
+	const auto &expr = *expr_filter.expr;
+	// The min/max bounds of a join: optional, so the hardware may drop the rows outside or keep them
+	auto join_bound = ExpressionFilter::GetOptionalFilterChild(expr);
+	if (join_bound) {
+		filter.hw_interval = ConstantInterval(*join_bound, scan_type);
+		filter.hw_optional = filter.hw_interval.has_value();
+		return;
+	}
+	filter.hw_interval = ConstantInterval(expr, scan_type);
+}
+
 // The type the decoder emits for the column before any narrowing of a chunk.
 static libstf::type_t TransferType(const OasisScanBindData &bind, const ProjectedColumn &col) {
 	return col.cast_type.value_or(bind.metadata.groups[0].chunks[col.column_id].logical_type());
@@ -182,11 +199,12 @@ void ClassifyHardwareFilters(ClientContext &context, const OasisScanGlobalState 
 			continue;
 		}
 		const auto &scan_type = bind.output_types[col.column_id];
-		filter.hw_interval = TryHardwareInterval(filter, col, scan_type, TransferType(bind, col));
+		ClassifyHardwareFilter(filter, col, scan_type, TransferType(bind, col));
 		if (filter.hw_interval) {
-			DUCKDB_LOG_DEBUG(context, "Hardware filter on column '%s': %s[%lld, %lld]",
-			                 bind.metadata.column_names[col.column_id].c_str(), filter.hw_interval->negate ? "not " : "",
-			                 (long long)filter.hw_interval->lo, (long long)filter.hw_interval->hi);
+			DUCKDB_LOG_DEBUG(context, "Hardware filter on column '%s': %s%s[%lld, %lld]",
+			                 bind.metadata.column_names[col.column_id].c_str(), filter.hw_optional ? "join " : "",
+			                 filter.hw_interval->negate ? "not " : "", (long long)filter.hw_interval->lo,
+			                 (long long)filter.hw_interval->hi);
 		}
 	}
 }
@@ -205,6 +223,12 @@ static HwInterval FitToLane(const HwInterval &interval, bool lane32) {
 	return HwInterval {std::max(interval.lo, lo), std::min(interval.hi, hi), interval.negate};
 }
 
+// The statistics of the column chunk in the group, or null without statistics.
+static unique_ptr<BaseStatistics> ChunkStats(OasisScanLocalState &lstate, size_t group, size_t column_id) {
+	const auto &pq_columns = lstate.parquet_reader->GetFileMetadata()->row_groups[group].columns;
+	return lstate.scan_state->GetColumnReader(column_id).Stats(group, pq_columns);
+}
+
 // Whether the column chunk can hold no NULL: the column is REQUIRED or its statistics say so. The
 // FilterStage compares the stored values without definition levels, so a NULL would compare as its
 // stored value.
@@ -213,9 +237,28 @@ static bool ChunkHasNoNulls(OasisScanLocalState &lstate, size_t group, const par
 	if (cc.is_required) {
 		return true;
 	}
-	const auto &pq_columns = lstate.parquet_reader->GetFileMetadata()->row_groups[group].columns;
-	auto stats = lstate.scan_state->GetColumnReader(column_id).Stats(group, pq_columns);
+	auto stats = ChunkStats(lstate, group, column_id);
 	return stats && !stats->CanHaveNull();
+}
+
+// The share of the chunk's rows that pass the interval if the values spread evenly over the
+// [min, max] of the chunk statistics; 1 without statistics.
+static double EstimatedPassFraction(OasisScanLocalState &lstate, size_t group, size_t column_id,
+                                    const HwInterval &interval) {
+	auto stats = ChunkStats(lstate, group, column_id);
+	if (!stats || !NumericStats::HasMinMax(*stats)) {
+		return 1;
+	}
+	auto min = StoredValue(NumericStats::Min(*stats));
+	auto max = StoredValue(NumericStats::Max(*stats));
+	if (!min || !max || *min > *max) {
+		return 1;
+	}
+	const auto overlap = Intersect(HwInterval {interval.lo, interval.hi, false}, HwInterval {*min, *max, false});
+	const long double inside = overlap.lo <= overlap.hi
+	                               ? ((long double)overlap.hi - overlap.lo + 1) / ((long double)*max - *min + 1)
+	                               : 0;
+	return double(interval.negate ? 1 - inside : inside);
 }
 
 // The FilterSpec as text, for the debug log (formatted only when the log is on).
@@ -233,9 +276,12 @@ bool PlanHardwareFilter(ClientContext &context, const OasisScanGlobalState &gsta
 	const size_t num_hw = pending.hw_slot.size();
 	const size_t num_cols = gstate.projected_columns.size();
 
-	// Per hardware column: the interval of the conjuncts the hardware takes and those conjuncts
+	// Per hardware column: the interval of the conjuncts the hardware takes, those conjuncts and whether
+	// one of them is required by DuckDB, i.e. not an optional join bound. Only a required conjunct saves
+	// filter time on the CPU.
 	std::vector<std::optional<HwInterval>> intervals(num_hw);
 	std::vector<std::vector<size_t>> taken(num_hw);
+	std::vector<bool> takes_required(num_hw, false);
 	for (size_t k = 0; k < num_hw; k++) {
 		const size_t i = pending.hw_slot[k];
 		const auto &col = gstate.projected_columns[i];
@@ -262,6 +308,7 @@ bool PlanHardwareFilter(ClientContext &context, const OasisScanGlobalState &gsta
 			}
 			interval = interval ? Intersect(*interval, candidate) : candidate;
 			taken[k].push_back(f);
+			takes_required[k] = takes_required[k] || !lstate.scan_filters[f].hw_optional;
 		}
 		if (interval) {
 			intervals[k] = FitToLane(*interval, lane32);
@@ -286,26 +333,54 @@ bool PlanHardwareFilter(ClientContext &context, const OasisScanGlobalState &gsta
 	}
 
 	// The hardware compares one emitted column at most: its values leave compacted by the final
-	// selection only if it is the last filter column. The other emitted filter columns keep their
-	// conjuncts on the CPU, which then filters the compacted vectors.
+	// selection only if it is the last filter column. The first emitted filter column with a required
+	// conjunct is compared, else the first one. The other emitted filter columns keep their conjuncts
+	// on the CPU, which then filters the compacted vectors.
 	std::optional<size_t> compare_emitted;
+	for (size_t k = 0; k < num_hw; k++) {
+		if (intervals[k] && hw_emit[pending.hw_slot[k]] &&
+		    (!compare_emitted || (takes_required[k] && !takes_required[*compare_emitted]))) {
+			compare_emitted = k;
+		}
+	}
 	bool any_filter = false;
+	bool any_required = false;
 	for (size_t k = 0; k < num_hw; k++) {
 		if (!intervals[k]) {
 			continue;
 		}
-		if (hw_emit[pending.hw_slot[k]]) {
-			if (compare_emitted) {
-				intervals[k].reset();
-				taken[k].clear();
-				continue;
-			}
-			compare_emitted = k;
+		if (hw_emit[pending.hw_slot[k]] && k != *compare_emitted) {
+			intervals[k].reset();
+			taken[k].clear();
+			continue;
 		}
 		any_filter = true;
+		any_required = any_required || takes_required[k];
 	}
 	if (!any_filter) {
 		return false;
+	}
+
+	// Take the group when the statistics expect at most the share of passing rows at which DuckDB
+	// still evaluates a min/max filter.
+	if (!any_required) {
+		double pass_fraction = 1;
+		for (size_t k = 0; k < num_hw; k++) {
+			if (intervals[k]) {
+				const size_t column_id = gstate.projected_columns[pending.hw_slot[k]].column_id;
+				pass_fraction =
+				    std::min(pass_fraction, EstimatedPassFraction(lstate, pending.group, column_id, *intervals[k]));
+			}
+		}
+		float threshold;
+		idx_t n_vectors_to_check;
+		GetThresholdAndVectorsToCheck(SelectivityOptionalFilterType::MIN_MAX, threshold, n_vectors_to_check);
+		if (pass_fraction > threshold) {
+			DUCKDB_LOG_DEBUG(context,
+			                 "Row group %llu on the CPU filter: the join bounds keep an estimated %.3f of the rows",
+			                 (unsigned long long)pending.group, pass_fraction);
+			return false;
+		}
 	}
 
 	// Without any emitted column the last filter column emits to carry the row count

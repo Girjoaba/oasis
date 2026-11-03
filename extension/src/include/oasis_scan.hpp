@@ -78,6 +78,8 @@ struct OasisScanFilter {
 	// The interval the hardware compares for this filter, if it is a comparison of the column with a
 	// constant the FilterStage can take (hw_filter.hpp). Set by ClassifyHardwareFilters.
 	std::optional<HwInterval> hw_interval;
+	// Whether hw_interval comes from an optional join filter (min/max of a hash join).
+	bool hw_optional = false;
 };
 
 struct OasisScanBindData : public TableFunctionData {
