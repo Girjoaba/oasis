@@ -15,6 +15,7 @@ include_directories(src/include)
 include_directories(duckdb/extension/parquet/include)
 include_directories(duckdb/third_party/parquet)
 include_directories(duckdb/third_party/thrift)
+include_directories(duckdb/third_party/snappy)
 
 # ---------------------------------------------------------------------------
 # Dependencies
@@ -38,7 +39,7 @@ find_package(oasis REQUIRED)
 set(EXTENSION_SOURCES src/oasis_extension.cpp src/oasis_scan.cpp src/oasis_profile.cpp
                       src/rdma_file_system.cpp src/filter_pushdown.cpp src/parcore_metadata_util.cpp
                       src/oasis_settings.cpp src/coalesced_fetcher.cpp src/hw_filter.cpp
-                      src/hw_bitmap.cpp)
+                      src/hw_bitmap.cpp src/hw_dictionary.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

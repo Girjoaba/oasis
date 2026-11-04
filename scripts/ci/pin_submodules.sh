@@ -6,18 +6,21 @@
 #
 # Oasis pins parcore, parcore pins libstf and libstf pins Coyote. parcore pins a libstf without the
 # Verilator fixes (libstf#33), and the Verilator simulation of Coyote sits on a fork branch, so a plain
-# submodule checkout gives sources that Verilator refuses. This script moves the three nested checkouts
-# to the recorded commits, top-down, and stops with exit 1 when a recorded commit does not contain the
-# commit that the parent tree pins: then the pin moved after the record, and record_pins.sh must run again.
+# submodule checkout gives sources that Verilator refuses. The dictionary ids output of the decoder
+# (emit_ids) sits on the parcore fork branch features/emit-ids until it is merged upstream; the Oasis
+# tree keeps pinning the upstream parcore commit it starts from. This script moves the three nested
+# checkouts to the recorded commits, top-down, and stops with exit 1 when a recorded commit does not
+# contain the commit that the parent tree pins: then the pin moved after the record, and record_pins.sh
+# must run again.
 #
 # Environment: PARCORE_URL, LIBSTF_URL, COYOTE_URL, the repositories that hold the recorded commits
-# (default: upstream parcore and libstf, the Girjoaba fork of Coyote on GitHub).
+# (default: the Girjoaba forks of parcore and Coyote, upstream libstf on GitHub).
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 PINS=scripts/ci/PINS
 [ -f "$PINS" ] || { echo "$PINS missing" >&2; exit 1; }
-: "${PARCORE_URL:=https://github.com/celeris-labs/parcore.git}"
+: "${PARCORE_URL:=https://github.com/Girjoaba/parcore.git}"
 : "${LIBSTF_URL:=https://github.com/fpgasystems/libstf.git}"
 : "${COYOTE_URL:=https://github.com/Girjoaba/Coyote.git}"
 

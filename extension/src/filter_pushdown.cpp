@@ -8,6 +8,7 @@
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/table/column_segment.hpp"
+#include "hw_dictionary.hpp"
 #include "parquet_reader.hpp"
 
 namespace duckdb {
@@ -223,7 +224,8 @@ idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &ls
 		}
 	}
 
-	// Phase 2: hardware-column filters, on the already-decoded flat vectors.
+	// Phase 2: hardware-column filters, on the already-decoded flat vectors. The conjuncts of a codes
+	// column evaluated over its dictionary look the dictionary id of each row up, all at once.
 	{
 		ScopedTimer timer(lstate.filter_time_ns);
 		for (size_t k = 0; k < lstate.scan_filters.size(); k++) {
@@ -236,6 +238,16 @@ idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &ls
 				continue;
 			}
 			auto &vec = scan_chunk.data[scan_filter.filter_idx];
+			// The conjuncts of a DictIdFilter stay on the CPU together: the first one filters for all
+			if (col.dict_ids && scan_filter.dict_id_filter) {
+				const auto &id_filter = lstate.current_dict_id_filters[scan_filter.filter_idx];
+				if (id_filter) {
+					if (k == id_filter->conjuncts.front()) {
+						FilterDictIds(vec, *id_filter, sel, approved_tuple_count);
+					}
+					continue;
+				}
+			}
 			ColumnSegment::FilterSelection(sel, vec, *scan_filter.filter_state, scan_count, approved_tuple_count);
 		}
 	}

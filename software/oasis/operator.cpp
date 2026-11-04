@@ -69,13 +69,14 @@ void DecodeColumnChunkOperator::apply(libstf::stream_t stream, OasisContext &ctx
 
     auto config = ctx.config<parcore::ColumnChunkDecoderConfig>();
     config->enqueue_column_chunk(stream, compression_, num_values_, type_, is_required_,
-                                 logical_type_);
+                                 logical_type_, emit_ids_);
 }
 
 void DecodeColumnChunkOperator::print(std::ostream &os) const {
     os << "DecodeColumnChunk(compression=" << compression_ << ", num_values=" << num_values_
        << ", type=" << type_ << ", is_required=" << is_required_
-       << ", logical_type=" << logical_type_ << ", filter=" << filter_ << ")";
+       << ", logical_type=" << logical_type_ << ", emit_ids=" << emit_ids_ << ", filter=" << filter_
+       << ")";
 }
 
 void LocalSinkOperator::apply(libstf::stream_t stream, OasisContext &ctx) {

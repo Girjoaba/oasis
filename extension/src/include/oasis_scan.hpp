@@ -84,6 +84,24 @@ struct HwScanFilter {
 	std::shared_ptr<const HwBitmap> bitmap;
 };
 
+// The ids of a dictionary that pass the conjuncts of a dictionary id column (hw_dictionary.hpp), evaluated
+// once per row group over the entries of its dictionary.
+struct DictIdFilter {
+	std::vector<bool> pass;
+	// The scan filters evaluated, and whether one of them is required, i.e. not an optional join bound.
+	std::vector<size_t> conjuncts;
+	bool required = false;
+	double pass_fraction = 1;
+	// What the hardware takes: an interval of the ids, or their bitmap with the interval [0, size - 1].
+	HwScanFilter hw;
+};
+
+// The dictionary of a dictionary id column in one row group.
+struct GroupDictionary {
+	buffer_ptr<DictionaryEntry> entry;
+	idx_t size = 0;
+};
+
 // Per-worker state for one pushed-down TableFilter. TableFilterState is not safe to share across
 // threads, so each worker owns its own (mirrors ParquetReader's per-scan-state scan_filters).
 struct OasisScanFilter {
@@ -114,6 +132,20 @@ struct OasisScanFilter {
 	bool prune_on_stats = true;
 	// What the hardware takes of the filter, copied from gstate.hw_filters.
 	HwScanFilter hw;
+	// On a dictionary id column: the filter evaluated over the dictionary, its child for an optional filter.
+	// Null when the filter stays on the rows (dynamic or able to throw).
+	unique_ptr<TableFilter> dict_id_filter;
+	unique_ptr<TableFilterState> dict_id_filter_state;
+	bool dict_id_optional = false;
+};
+
+// A string column chunk whose data pages are all dictionary-encoded: the decoders emit its codes, the
+// host decodes its dictionary page.
+struct DictionaryChunk {
+	// The data pages, read from the first one on and decoded as INT32 codes
+	parcore::metadata::ColumnChunk ids;
+	uint64_t dict_offset;
+	uint64_t dict_size;
 };
 
 struct OasisScanBindData : public TableFunctionData {
@@ -128,6 +160,9 @@ struct OasisScanBindData : public TableFunctionData {
 	// Reader over parquet_metadata that does not open the file. It answers statistics questions at
 	// plan time, and must outlive the partition statistics it hands out (they reference it).
 	shared_ptr<ParquetReader> metadata_reader;
+	// Per row group and file column: the chunk of a string column whose data pages are all
+	// dictionary-encoded, as its codes (BuildDictionaryChunks).
+	vector<vector<std::optional<DictionaryChunk>>> dict_chunks;
 };
 
 struct ProjectedColumn {
@@ -139,6 +174,8 @@ struct ProjectedColumn {
 	bool narrowable = false;
 	// Type the decoders cast the column to for a cast pushed into the scan (oasis_cast_pushdown).
 	std::optional<libstf::type_t> cast_type;
+	// String column whose chunks go to the hardware as their dictionary ids (elem_size 4).
+	bool dict_ids = false;
 
 	// Bytes per value the hardware writes for a chunk of the column, 4 for a narrowed chunk.
 	size_t TransferSize(bool narrowed) const {
@@ -156,6 +193,7 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 
 	vector<ProjectedColumn> projected_columns;
 	bool has_cpu_columns = false;
+	bool has_dict_id_columns = false;
 
 	// Whether chunks of narrowable columns are decoded to INT32 when their statistics fit
 	// (oasis_narrow_transfer).
@@ -170,12 +208,17 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	std::vector<bool> column_emitted;
 
 	optional_ptr<TableFilterSet> filters;
+	// The filters of the plan, before the dynamic join filters merge into `filters`.
+	optional_ptr<TableFilterSet> static_filters;
 
 	// Hardware filtering (oasis_hw_filter): the FilterStage of each decoder compares the values of a
 	// column chunk with an interval and drops the rows that fail from every column of the row group
 	// (hw_filter.hpp). Off for scans with CPU columns, which would need the selection on the host,
 	// and without the FilterStage in the bitstream.
 	bool hw_filter = false;
+	// The stages the hardware filter takes (oasis_hw_filter_stage): 1 the constant comparisons, 2 the
+	// bounds of the joins, 3 the bitmaps, 4 the string columns as their dictionary ids.
+	uint64_t hw_filter_stage = 0;
 
 	// Dynamic join filters (min/max pushed by hash joins into the probe-side scan). Our global
 	// state is created at schedule time (INITIALIZE_ON_SCHEDULE), before the build side has run,
@@ -278,6 +321,10 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 		std::vector<size_t> order;
 		std::vector<bool> hw_emit;
 
+		// Per projection index of a dictionary id column: its dictionary and the ids its conjuncts pass.
+		std::vector<GroupDictionary> dictionaries;
+		std::vector<std::shared_ptr<const DictIdFilter>> dict_id_filters;
+
 		oasis::SplinterResultHandle result;
 		bool submitted = false;
 		size_t batches_remaining = 0;
@@ -301,6 +348,10 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 	// The current group's hw_emit flags (see PendingGroup): a hardware column the hardware did not
 	// write has no buffer contents and gets no vector.
 	std::vector<bool> current_hw_emit;
+
+	// The current group's dictionaries and dictionary id filters (see PendingGroup).
+	std::vector<GroupDictionary> current_dictionaries;
+	std::vector<std::shared_ptr<const DictIdFilter>> current_dict_id_filters;
 
 	size_t current_buf_offset = 0;
 	size_t current_group_num_rows = 0;

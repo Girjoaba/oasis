@@ -24,6 +24,7 @@
 #include "rdma_file_system.hpp"
 #include "reader/struct_column_reader.hpp"
 #include "filter_pushdown.hpp"
+#include "hw_dictionary.hpp"
 #include "hw_filter.hpp"
 
 #include <algorithm>
@@ -75,6 +76,7 @@ unique_ptr<FunctionData> OasisScanBind(ClientContext &context, TableFunctionBind
 	}
 	bind_data->metadata = std::move(meta);
 	bind_data->filename = parquet_file;
+	BuildDictionaryChunks(parquet_reader, *bind_data);
 
 	bind_data->parquet_metadata = parquet_reader.metadata;
 	bind_data->metadata_reader = ParquetReader::CreateMetadataReader(context, parquet_opts, parquet_reader.metadata);
@@ -193,6 +195,7 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	gstate->filename = bind_data.filename;
 	gstate->total_groups = bind_data.metadata.groups.size();
 	gstate->filters = input.filters;
+	gstate->static_filters = input.filters;
 	if (input.op && input.op->type == PhysicalOperatorType::TABLE_SCAN) {
 		gstate->physical_scan = &input.op->Cast<PhysicalTableScan>();
 	}
@@ -213,11 +216,35 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 
 	Value hw_filter_val;
 	context.TryGetCurrentSetting("oasis_hw_filter", hw_filter_val);
-	const bool hw_filter_setting = hw_filter_val.IsNull() || hw_filter_val.GetValue<bool>();
+	Value stage_val;
+	context.TryGetCurrentSetting("oasis_hw_filter_stage", stage_val);
+	const uint64_t stage = stage_val.IsNull() ? 4 : stage_val.GetValue<uint64_t>();
+	if (stage > 4) {
+		throw InvalidInputException("oasis_hw_filter_stage is %llu, it must be 0 to 4", (unsigned long long)stage);
+	}
+	const bool hw_filter_setting = (hw_filter_val.IsNull() || hw_filter_val.GetValue<bool>()) && stage > 0;
+	gstate->hw_filter_stage = hw_filter_setting ? stage : 0;
+
+	// Stage 4: a string column whose chunks are all dictionary-encoded goes to the decoders as its dictionary ids
+	const bool emit_ids_supported = gstate->hw_filter_stage >= 4 &&
+	                                ctx.has_config<parcore::ColumnChunkDecoderConfig>() &&
+	                                ctx.config<parcore::ColumnChunkDecoderConfig>()->supports_emit_ids();
+	auto all_dict_coded = [&](size_t col_id) {
+		return std::all_of(bind_data.dict_chunks.begin(), bind_data.dict_chunks.end(),
+		                   [&](const auto &group) { return group[col_id].has_value(); });
+	};
 
 	for (auto col_id : input.column_ids) {
 		const auto &chunk = bind_data.metadata.groups[0].chunks[col_id];
-		if (parcore::metadata::is_libstf_type(chunk.type)) {
+		if (emit_ids_supported && bind_data.output_types[col_id] == bind_data.column_types[col_id] &&
+		    all_dict_coded(col_id)) {
+			ProjectedColumn col {col_id, sizeof(int32_t), false};
+			col.dict_ids = true;
+			gstate->projected_columns.push_back(col);
+			gstate->has_dict_id_columns = true;
+			DUCKDB_LOG_DEBUG(context, "Column '%s' goes to the decoders as its dictionary ids.",
+			                 bind_data.metadata.column_names[col_id].c_str());
+		} else if (parcore::metadata::is_libstf_type(chunk.type)) {
 			const auto &column_type = bind_data.output_types[col_id];
 			// A cast pushed into the scan is done by the decoders
 			std::optional<libstf::type_t> cast_type;
@@ -361,6 +388,7 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
 		for (size_t f = 0; f < gstate.hw_filters.size(); f++) {
 			lstate->scan_filters[f].hw = gstate.hw_filters[f];
 		}
+		InitDictIdFilters(context.client, gstate, *lstate);
 	}
 
 	return std::move(lstate);
@@ -412,6 +440,15 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
                           OasisScanLocalState::PendingGroup &pending) {
 	const size_t group = pending.group;
 	auto *rdma = dynamic_cast<RDMAFileHandle *>(lstate.file_handle.get());
+	pending.hw_buffers.assign(gstate.projected_columns.size(), nullptr);
+	pending.cpu_buffers.assign(gstate.projected_columns.size(), {});
+	pending.hw_emit.assign(gstate.projected_columns.size(), true);
+
+	// The dictionaries of the dictionary id columns, and the conjuncts on them evaluated over the entries
+	if (!PrepareDictIdColumns(context, gstate, lstate, bind, pending)) {
+		pending.num_rows = 0;
+		return;
+	}
 
 	// Collect the column chunks that will be decoded in hardware, and (RDMA only) the CPU column
 	// chunks whose bytes the splinter fetches over the bypass stream.
@@ -428,7 +465,8 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 			continue;
 		}
 
-		const auto &cc = bind.metadata.groups[group].chunks[col.column_id];
+		const auto &cc =
+		    col.dict_ids ? bind.dict_chunks[group][col.column_id]->ids : bind.metadata.groups[group].chunks[col.column_id];
 
 		pending.narrowed[i] = gstate.narrow_transfer && col.narrowable && ChunkFitsInt32(lstate, group, col.column_id);
 
@@ -485,7 +523,6 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 		pending.order.resize(pending.hw_slot.size());
 		std::iota(pending.order.begin(), pending.order.end(), 0);
 		pending.specs.assign(pending.hw_slot.size(), oasis::FilterSpec {});
-		pending.hw_emit.assign(gstate.projected_columns.size(), true);
 	}
 
 	// Build the QuerySplinter for the whole row group -- one decode flow per hardware column, one
@@ -509,7 +546,7 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 			flow.push_back(MakeHostSource(pending.fetcher->Resolve(pending.host_handles[k])));
 		}
 		flow.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type,
-		                                                                   cc.is_required, logical_type, spec));
+		                                                                   cc.is_required, logical_type, spec, col.dict_ids));
 		// A chunk the hardware does not emit still takes one (minimal) buffer
 		auto sink_buffer = ctx.allocate_output_buffer(spec.emit ? cc.num_values * libstf::size_of(logical_type) : 0);
 		flow.push_back(std::make_unique<oasis::LocalSinkOperator>(std::move(sink_buffer), pending.hw_slot[k]));
@@ -536,9 +573,6 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 		flow.push_back(std::make_unique<oasis::LocalSinkOperator>(std::move(sink_buffers), pending.cpu_slot[k]));
 		splinter.streams.push_back(std::move(flow));
 	}
-
-	pending.hw_buffers.assign(gstate.projected_columns.size(), nullptr);
-	pending.cpu_buffers.assign(gstate.projected_columns.size(), {});
 
 	// A group with nothing to fetch or decode in hardware (e.g. a string-only projection on the
 	// local path) submits no splinter and leaves `result` default-constructed.
@@ -751,6 +785,8 @@ static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx,
 	lstate.current_narrowed = std::move(head.narrowed);
 	lstate.current_needs_row_filter = std::move(head.needs_row_filter);
 	lstate.current_hw_emit = std::move(head.hw_emit);
+	lstate.current_dictionaries = std::move(head.dictionaries);
+	lstate.current_dict_id_filters = std::move(head.dict_id_filters);
 	lstate.current_buf_offset = 0;
 	lstate.current_group_num_rows = num_rows;
 	lstate.current_group = head.group;
@@ -838,6 +874,27 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 		auto &vec = scan_chunk.data[i];
 		vec.SetVectorType(VectorType::FLAT_VECTOR);
 
+		// The ids select the entries of the group's dictionary. They are copied into the selection
+		// vector, which a dictionary vector owns.
+		if (col.dict_ids) {
+			const auto &dictionary = lstate.current_dictionaries[i];
+			auto src = reinterpret_cast<const uint32_t *>(buf->ptr) + lstate.current_buf_offset;
+			SelectionVector ids(emit);
+			uint32_t max_id = 0;
+			for (size_t r = 0; r < emit; r++) {
+				ids.set_index(r, src[r]);
+				max_id = std::max(max_id, src[r]);
+			}
+			if (emit > 0 && max_id >= dictionary.size) {
+				throw InternalException(
+				    "Row group %llu: dictionary id %llu of column %llu is outside its dictionary of %llu entries",
+				    (unsigned long long)lstate.current_group, (unsigned long long)max_id, (unsigned long long)i,
+				    (unsigned long long)dictionary.size);
+			}
+			vec.Dictionary(dictionary.entry, ids, emit);
+			continue;
+		}
+
 		// A chunk transferred as INT32 is sign-extended into the vector's own memory (the reset
 		// chunk's vectors own STANDARD_VECTOR_SIZE values again).
 		if (narrowed) {
@@ -885,6 +942,8 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 	lstate.current_buf_offset += emit;
 	if (lstate.current_buf_offset >= total_elements) {
 		lstate.current_buffers.assign(gstate.projected_columns.size(), nullptr);
+		lstate.current_dictionaries.clear();
+		lstate.current_dict_id_filters.clear();
 		lstate.current_buf_offset = 0;
 		lstate.current_group_num_rows = 0;
 	}
@@ -1005,10 +1064,16 @@ void OasisScanGetMetrics(TableFunctionGetMetricsInput &input) {
 	if (gstate.filters) {
 		input.operator_metrics.AddExtraInfo("Filter Time", seconds(gstate.filter_time_ns.load()));
 	}
-	if (gstate.has_cpu_columns) {
+	if (gstate.has_cpu_columns || gstate.has_dict_id_columns) {
 		input.operator_metrics.AddExtraInfo("String Decode Time", seconds(gstate.string_decode_time_ns.load()));
 	}
+	if (gstate.has_dict_id_columns) {
+		const auto dict_id_columns = std::count_if(gstate.projected_columns.begin(), gstate.projected_columns.end(),
+		                                           [](const ProjectedColumn &col) { return col.dict_ids; });
+		input.operator_metrics.AddExtraInfo("HW Dictionary Id Columns", std::to_string(dict_id_columns));
+	}
 	if (gstate.hw_filter && gstate.filters) {
+		input.operator_metrics.AddExtraInfo("HW Filter Stage", std::to_string(gstate.hw_filter_stage));
 		input.operator_metrics.AddExtraInfo("HW Filter Groups", std::to_string(gstate.hw_filter_groups.load()));
 		input.operator_metrics.AddExtraInfo("HW Filter Rows In", std::to_string(gstate.hw_filter_rows_in.load()));
 		input.operator_metrics.AddExtraInfo("HW Filter Rows Out", std::to_string(gstate.hw_filter_rows_out.load()));

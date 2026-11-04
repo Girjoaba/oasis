@@ -110,17 +110,19 @@ std::ostream &operator<<(std::ostream &os, const FilterSpec &spec);
 
 /**
  * Programs the configuration (compression, value count, physical type, whether the column is
- * REQUIRED, logical type) via ColumnChunkDecoderConfig::enqueue_column_chunk, preceded by the
- * FilterSpec of the chunk via FilterConfig::enqueue. The hardware pairs the two in order, so every
- * decode flow writes exactly one filter conf.
+ * REQUIRED, logical type, whether the decoder emits the dictionary codes) via
+ * ColumnChunkDecoderConfig::enqueue_column_chunk, preceded by the FilterSpec of the chunk via
+ * FilterConfig::enqueue. The hardware pairs the two in order, so every decode flow writes exactly
+ * one filter conf.
  */
 class DecodeColumnChunkOperator final : public Operator {
   public:
     DecodeColumnChunkOperator(parcore::metadata::Compression compression, uint64_t num_values,
                               libstf::type_t type, bool is_required, libstf::type_t logical_type,
-                              FilterSpec filter = {})
+                              FilterSpec filter = {}, bool emit_ids = false)
         : compression_(compression), num_values_(num_values), type_(type),
-          is_required_(is_required), logical_type_(logical_type), filter_(filter) {}
+          is_required_(is_required), logical_type_(logical_type), filter_(filter),
+          emit_ids_(emit_ids) {}
 
     void apply(libstf::stream_t stream, OasisContext &ctx) override;
     void print(std::ostream &os) const override;
@@ -132,6 +134,7 @@ class DecodeColumnChunkOperator final : public Operator {
     bool                           is_required_;
     libstf::type_t                 logical_type_;
     FilterSpec                     filter_;
+    bool                           emit_ids_;
 };
 
 /**

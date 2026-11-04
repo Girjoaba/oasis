@@ -165,12 +165,17 @@ static std::optional<HwInterval> ConstantInterval(const Expression &expr, const 
 // list of a hash join), so the hardware may pass a superset: both bitmaps fold when their span does
 // not fit. Everything else stays on the CPU: the dynamic (top-N) and bloom filters, OR, LIKE, a type
 // the hardware does not compare and a column a pushed cast narrowed. Independent of the row group.
+// The stage limits what the hardware takes: 1 the comparisons of the plan, 2 also those of the
+// joins (`dynamic`), 3 also the bitmaps.
 static HwScanFilter ClassifyHardwareFilter(oasis::FilterTable &table, const OasisScanFilter &filter,
                                            const ProjectedColumn &col, const LogicalType &scan_type,
-                                           libstf::type_t transfer_type) {
+                                           libstf::type_t transfer_type, uint64_t stage, bool dynamic) {
 	HwScanFilter hw;
 	// A column a cast narrowed, or a filter rebound to the narrow type, keeps its filters on the CPU
 	if (col.cast_type || filter.row_filter || !filter.prune_on_stats) {
+		return hw;
+	}
+	if (dynamic && stage < 2) {
 		return hw;
 	}
 	if (!HwFilterCompareType(transfer_type)) {
@@ -186,7 +191,7 @@ static HwScanFilter ClassifyHardwareFilter(oasis::FilterTable &table, const Oasi
 	const auto &expr = *expr_filter.expr;
 	auto classify = [&](const Expression &e, bool optional) {
 		hw.interval = ConstantInterval(e, scan_type);
-		if (hw.interval) {
+		if (hw.interval || stage < 3) {
 			return;
 		}
 		if (auto bitmap = LookupBitmap(table, e, scan_type, optional)) {
@@ -208,22 +213,40 @@ static HwScanFilter ClassifyHardwareFilter(oasis::FilterTable &table, const Oasi
 
 // The type the decoder emits for the column before any narrowing of a chunk.
 static libstf::type_t TransferType(const OasisScanBindData &bind, const ProjectedColumn &col) {
+	if (col.dict_ids) {
+		return libstf::type_t::INT32_T;
+	}
 	return col.cast_type.value_or(bind.metadata.groups[0].chunks[col.column_id].logical_type());
 }
 
 std::vector<HwScanFilter> ClassifyHardwareFilters(ClientContext &context, const OasisScanGlobalState &gstate,
                                                   const OasisScanBindData &bind) {
-	std::vector<OasisScanFilter> scan_filters;
+	std::vector<OasisScanFilter> scan_filters, static_filters;
 	BuildScanFilters(context, *gstate.filters, gstate, bind, scan_filters);
+	if (gstate.static_filters) {
+		BuildScanFilters(context, *gstate.static_filters, gstate, bind, static_filters);
+	}
+	// A conjunct of the plan, else one the dynamic filter merge added
+	auto is_static = [&](const OasisScanFilter &filter) {
+		if (filter.filter.filter_type != TableFilterType::EXPRESSION_FILTER) {
+			return true;
+		}
+		return std::any_of(static_filters.begin(), static_filters.end(), [&](const OasisScanFilter &other) {
+			return other.filter_idx == filter.filter_idx && other.filter.filter_type == TableFilterType::EXPRESSION_FILTER &&
+			       filter.filter.Cast<ExpressionFilter>().Equals(other.filter.Cast<ExpressionFilter>());
+		});
+	};
 	std::vector<HwScanFilter> hw_filters(scan_filters.size());
 	for (size_t f = 0; f < scan_filters.size(); f++) {
 		const auto &col = gstate.projected_columns[scan_filters[f].filter_idx];
-		if (col.is_cpu) {
+		// The filters of a dictionary id column are evaluated over its dictionary per row group (hw_dictionary.hpp)
+		if (col.is_cpu || col.dict_ids) {
 			continue;
 		}
 		const auto &scan_type = bind.output_types[col.column_id];
 		auto &hw = hw_filters[f];
-		hw = ClassifyHardwareFilter(gstate.ctx->filter_table(), scan_filters[f], col, scan_type, TransferType(bind, col));
+		hw = ClassifyHardwareFilter(gstate.ctx->filter_table(), scan_filters[f], col, scan_type, TransferType(bind, col),
+		                            gstate.hw_filter_stage, !is_static(scan_filters[f]));
 		if (hw.bitmap) {
 			const auto &bitmap = *hw.bitmap;
 			DUCKDB_LOG_DEBUG(context, "Hardware filter on column '%s': %sbitmap [%lld, %lld] >> %u, %llu words, %.3f set",
@@ -326,6 +349,20 @@ bool PlanHardwareFilter(ClientContext &context, const OasisScanGlobalState &gsta
 		const auto &cc = *pending.hw_chunks[k];
 		const bool lane32 = col.TransferSize(pending.narrowed[i]) == sizeof(int32_t);
 
+		// The ids that pass the conjuncts of a dictionary id column, all of them at once. Its bitmap is exact,
+		// so without room in the table the conjuncts stay on the CPU.
+		if (col.dict_ids) {
+			const auto &id_filter = pending.dict_id_filters[i];
+			if (!id_filter || (id_filter->hw.bitmap && !id_filter->hw.bitmap->Region(gstate.ctx->filter_table()))) {
+				continue;
+			}
+			intervals[k] = id_filter->hw.interval;
+			bitmaps[k] = id_filter->hw.bitmap;
+			taken[k] = id_filter->conjuncts;
+			takes_required[k] = id_filter->required;
+			continue;
+		}
+
 		std::vector<size_t> candidates;
 		for (size_t f = 0; f < lstate.scan_filters.size(); f++) {
 			const auto &filter = lstate.scan_filters[f];
@@ -421,11 +458,17 @@ bool PlanHardwareFilter(ClientContext &context, const OasisScanGlobalState &gsta
 	if (!any_required) {
 		double pass_fraction = 1;
 		for (size_t k = 0; k < num_hw; k++) {
-			if (intervals[k]) {
-				const size_t column_id = gstate.projected_columns[pending.hw_slot[k]].column_id;
-				pass_fraction = std::min(pass_fraction, EstimatedPassFraction(lstate, pending.group, column_id,
-				                                                              *intervals[k], bitmaps[k].get()));
+			if (!intervals[k]) {
+				continue;
 			}
+			const size_t i = pending.hw_slot[k];
+			if (gstate.projected_columns[i].dict_ids) {
+				pass_fraction = std::min(pass_fraction, pending.dict_id_filters[i]->pass_fraction);
+				continue;
+			}
+			pass_fraction = std::min(pass_fraction, EstimatedPassFraction(lstate, pending.group,
+			                                                              gstate.projected_columns[i].column_id,
+			                                                              *intervals[k], bitmaps[k].get()));
 		}
 		float threshold;
 		idx_t n_vectors_to_check;

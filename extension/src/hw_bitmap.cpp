@@ -59,14 +59,12 @@ static std::optional<uint32_t> FoldShift(int64_t min, int64_t max, uint64_t budg
 	return std::nullopt;
 }
 
-static void SetBit(std::vector<uint64_t> &words, uint64_t bit) {
+void SetBit(std::vector<uint64_t> &words, uint64_t bit) {
 	words[bit / 64] |= uint64_t(1) << (bit % 64);
 }
 
-// The bitmap of `words` over [min, max]. A bitmap that sets every bit, or that is not exact and sets
-// about every bit, keeps no words: its interval goes to the hardware alone.
-static std::shared_ptr<const HwBitmap> MakeBitmap(int64_t min, int64_t max, uint32_t shift, bool exact,
-                                                  std::vector<uint64_t> words) {
+std::shared_ptr<const HwBitmap> MakeBitmap(int64_t min, int64_t max, uint32_t shift, bool exact,
+                                           std::vector<uint64_t> words) {
 	auto bitmap = std::make_shared<HwBitmap>();
 	bitmap->min = min;
 	bitmap->max = max;

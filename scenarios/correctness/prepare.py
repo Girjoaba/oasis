@@ -9,6 +9,8 @@ read_parquet (DuckDB's own reader) and counts the rows that differ in either dir
 
 - tpch_q01 .. tpch_q22: the TPC-H queries of tpch_queries() at --sf over rdma://.
 - edge: the edge cases of CASES over rdma://. Every case must give 0 differing rows.
+- edge_stages: the cases of STAGE_CASES at every oasis_hw_filter_stage, each with 0 differing rows,
+  and a check of the log that no stage uses a feature of a later stage.
 - gap_<case>: one scenario per input of GAPS, which the decoder does not support yet. The case
   must give 0 differing rows or fail with an error, never wrong rows. One scenario each, so a
   case that hangs or crashes the shell does not hide the others.
@@ -122,6 +124,18 @@ DUCKDB_FILES: Dict[str, Tuple[str, str]] = {
                ((i // 64)::BIGINT * 4096 + i % 64)::BIGINT AS c_kwide,
                (i * 31 % 1000)::INTEGER AS c_val, (i * 0.5)::DOUBLE AS c_double
         FROM range({MANY_RG_ROWS}) r(i)""", f", ROW_GROUP_SIZE {RG}"),
+    # Hardware strings as their dictionary ids: low cardinality strings whose dictionary order changes
+    # per row group (the first row of a group fixes it), empty and multi-byte strings, about 3 000
+    # values (dictionaries of many words), c_gap with 'b' only in the odd row groups inside the [min,
+    # max] of every group, so only the dictionary rules it out, and c_plain with NULLs (a CPU column).
+    "e_dict": (f"""
+        SELECT i::INTEGER AS c_id, (i * 31 % 1000)::INTEGER AS c_val,
+               ['MAIL', 'SHIP', 'AIR', 'RAIL', 'TRUCK', 'FOB', 'REG AIR'][1 + (i + i // {RG}) % 7] AS c_mode,
+               ['', 'üñî', 'naïve', 'x', 'Ω≈ç'][1 + (i * 3 + i // {RG}) % 5] AS c_small,
+               'v' || lpad((i * 7919 % 3000)::VARCHAR, 4, '0') AS c_many,
+               CASE WHEN (i // {RG}) % 2 = 0 THEN ['a', 'c'][1 + i % 2] ELSE ['a', 'b', 'c'][1 + i % 3] END AS c_gap,
+               CASE WHEN i % 1000 = 0 THEN NULL ELSE 'u' || i END AS c_plain
+        FROM range({MANY_RG_ROWS}) r(i)""", f", ROW_GROUP_SIZE {RG}, DICTIONARY_SIZE_LIMIT 4096"),
     # Known gaps.
     "g_nulls": ("""
         SELECT i::INTEGER AS c_id,
@@ -289,6 +303,52 @@ CASES: Dict[str, str] = {
     "hwf_in_and_range": "SELECT c_id, c_val FROM {e_prf} WHERE c_val IN (3, 77, 150, 151, 500, 999) AND c_val > 100",
     # The span of the values does not fit a region: the bitmap folds, the IN above the scan drops the rest.
     "hwf_in_wide": "SELECT c_id FROM {e_prf} WHERE c_k64 IN (1000000000000, 1000000100000, 1001000000000, 1000000000005)",
+    # Strings as their dictionary ids: the conjuncts are evaluated over the dictionary of each row
+    # group, the ids that pass go to the hardware as an interval, the interval negated or a bitmap.
+    "hws_eq": "SELECT c_id, c_mode FROM {e_dict} WHERE c_mode = 'SHIP'",
+    "hws_ne": "SELECT c_id, c_mode FROM {e_dict} WHERE c_mode <> 'SHIP'",
+    "hws_range": "SELECT c_id, c_mode FROM {e_dict} WHERE c_mode < 'RAIL'",
+    "hws_in": "SELECT c_id, c_mode FROM {e_dict} WHERE c_mode IN ('MAIL', 'SHIP', 'FOB')",
+    "hws_like": "SELECT c_id, c_many FROM {e_dict} WHERE c_many LIKE 'v00%'",
+    "hws_not_like": "SELECT c_id, c_mode FROM {e_dict} WHERE c_mode NOT LIKE '%AIR'",
+    "hws_bitmap": "SELECT c_id, c_many FROM {e_dict} WHERE c_many LIKE '%3'",
+    "hws_unicode": "SELECT c_id, c_small FROM {e_dict} WHERE c_small IN ('', 'üñî')",
+    # No entry passes in the even row groups, every entry passes, no filter.
+    "hws_skip": "SELECT c_id, c_gap FROM {e_dict} WHERE c_gap = 'b'",
+    "hws_all": "SELECT c_id, c_mode FROM {e_dict} WHERE c_mode <> 'NONE'",
+    "hws_proj": "SELECT c_id, c_mode, c_small, c_many, c_gap FROM {e_dict}",
+    "hws_count": "SELECT count(*) AS n FROM {e_dict} WHERE c_many LIKE '%7%'",
+    # A dictionary id column next to a constant on an INTEGER column, as filter, as projection, both.
+    "hws_with_int": "SELECT c_id, c_mode FROM {e_dict} WHERE c_val < 300",
+    "hws_and_int": "SELECT c_id FROM {e_dict} WHERE c_mode IN ('AIR', 'TRUCK') AND c_val < 500",
+    "hws_emit_both": "SELECT c_id, c_val, c_mode FROM {e_dict} WHERE c_mode IN ('AIR', 'TRUCK') AND c_val < 500",
+    # Two dictionary id columns, and two conjuncts on one.
+    "hws_two": "SELECT c_id, c_small FROM {e_dict} WHERE c_mode IN ('AIR', 'RAIL') AND c_small = 'naïve'",
+    "hws_same_col": "SELECT c_id, c_mode FROM {e_dict} WHERE c_mode >= 'B' AND c_mode <> 'SHIP'",
+    # The keys of a join on a string column.
+    "hws_join": """SELECT a.c_id, a.c_mode FROM {e_dict} a
+                   JOIN (SELECT DISTINCT c_mode FROM {e_dict} WHERE c_id < 2) b ON a.c_mode = b.c_mode""",
+    # Downstream of the scan: the dictionary vectors in a GROUP BY.
+    "hws_group": "SELECT c_mode, count(*) AS n, sum(c_val) AS s FROM {e_dict} WHERE c_val > 100 GROUP BY c_mode",
+    # A CPU string column in the scan: the hardware filter is off, the CPU looks the dictionary ids up.
+    "hws_plain_next": "SELECT c_id, c_mode, c_plain FROM {e_dict} WHERE c_mode = 'AIR'",
+}
+
+# The cases of edge_stages, run at every oasis_hw_filter_stage: one or two per stage of the hardware
+# filter and every hws_* case.
+STAGE_CASES = ["hwf_mixed", "hwf_eq_first", "hwf_join_one_key_i32", "hwf_join_minmax", "hwf_join_ineq",
+               "hwf_prf_i32", "hwf_prf_fold", "hwf_in_i32", "hwf_in_wide"] + [c for c in CASES if c.startswith("hws_")]
+STAGES = range(5)
+
+# The hardware filter messages of the log (duckdb_logs at DEBUG) and the first stage that may log them: no
+# stage uses a feature of a later one. A join bound comes from stage 2 on, a bitmap from stage 3, a
+# dictionary id column from stage 4, which must log one.
+DICT_IDS_MESSAGE = "message LIKE '%as its dictionary ids%'"
+STAGE_LOG_CHECKS = {
+    "no_hw": ("message LIKE 'Row group %: column%'", 1),
+    "no_join": ("message LIKE 'Hardware filter on column%: join%'", 2),
+    "no_bitmap": ("message LIKE 'Hardware filter on column%bitmap%'", 3),
+    "no_dict_ids": (DICT_IDS_MESSAGE, 4),
 }
 
 # Known gaps (extension/test/README.md, "Known gaps", and the codecs and encodings ParCore lacks).
@@ -356,6 +416,31 @@ def cases_sql(cases: Dict[str, str], files: List[str]) -> str:
     return "".join(lines) + FOOTER
 
 
+def stages_sql(cases: Dict[str, str], files: List[str]) -> Tuple[str, List[str]]:
+    """The cases at every stage of the hardware filter, with the log checks of each stage, and the names
+    of the result columns that must be true."""
+    hw = {f: hw_source(f) for f in files}
+    sw = {f: sw_source(f) for f in files}
+    lines = [HEADER, "SET enable_logging = true;\nSET logging_level = 'DEBUG';\nSET logging_storage = 'memory';\n"]
+    for name, query in cases.items():
+        lines.append(f"CREATE TEMP TABLE {name}_sw AS {query.format_map(sw)};\n")
+    true_keys = []
+    for stage in STAGES:
+        lines.append(f"SET oasis_hw_filter_stage = {stage};\nCALL truncate_duckdb_logs();\n")
+        for name, query in cases.items():
+            lines.append(f"CREATE TEMP TABLE {name}_hw{stage} AS {query.format_map(hw)};\n")
+            lines.append(f"SELECT {diff_sql(f'{name}_hw{stage}', name + '_sw')} = 0 AS same_{name}_s{stage};\n")
+            true_keys.append(f"same_{name}_s{stage}")
+        for key, (condition, first_stage) in STAGE_LOG_CHECKS.items():
+            if stage < first_stage:
+                lines.append(f"SELECT count(*) = 0 AS {key}_s{stage} FROM duckdb_logs WHERE {condition};\n")
+                true_keys.append(f"{key}_s{stage}")
+        if stage == max(STAGES):
+            lines.append(f"SELECT count(*) > 0 AS dict_ids_s{stage} FROM duckdb_logs WHERE {DICT_IDS_MESSAGE};\n")
+            true_keys.append(f"dict_ids_s{stage}")
+    return "".join(lines) + FOOTER, true_keys
+
+
 def write_scenario(out: Path, name: str, sql: str, files: List[str], checks: List[dict],
                    allow_errors: bool = False) -> str:
     (out / f"{name}.sql").write_text(sql)
@@ -409,6 +494,12 @@ def main() -> int:
     efiles = files_of(" ".join(CASES.values()))
     names.append(write_scenario(out, "edge", cases_sql(CASES, efiles), efiles,
                                 [{"expect": {f"diff_{c}": 0 for c in CASES}}, done]))
+
+    # The ablation of the stages of the hardware filter, by the setting alone
+    stage_cases = {c: CASES[c] for c in STAGE_CASES}
+    sfiles = files_of(" ".join(stage_cases.values()))
+    sql, true_keys = stages_sql(stage_cases, sfiles)
+    names.append(write_scenario(out, "edge_stages", sql, sfiles, [{"expect": {k: True for k in true_keys}}, done]))
 
     # One per gap
     for case, query in GAPS.items():

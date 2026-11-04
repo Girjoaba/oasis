@@ -59,9 +59,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "oasis_hw_filter",
 	    "Whether read_oasis pushes constant comparisons on INTEGER, BIGINT, DATE, DECIMAL and TIMESTAMP "
 	    "columns into the decoders, which drop the failing rows of every column of the row group before "
-	    "the transfer. Needs a bitstream with the FilterStage. Scans with string columns and row groups "
-	    "with more rows than the selection bitmap holds are filtered on the CPU.",
+	    "the transfer. Needs a bitstream with the FilterStage. Scans with string columns the decoders do not "
+	    "take as dictionary ids and row groups with more rows than the selection bitmap holds are filtered on the CPU.",
 	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption(
+	    "oasis_hw_filter_stage",
+	    "The stages of the hardware filter read_oasis uses, each with the ones before: 0 none, 1 the constant "
+	    "comparisons of the query, 2 the bounds of the hash joins, 3 the bitmap lookup (prefix range filters, "
+	    "IN lists), 4 the dictionary-encoded string columns as their dictionary ids and their filters. Needs "
+	    "oasis_hw_filter; stage 4 needs decoders that emit the dictionary ids.",
+	    LogicalType::UBIGINT, Value::UBIGINT(4));
 	config.AddExtensionOption(
 	    "oasis_cast_pushdown",
 	    "Whether read_oasis accepts integer narrowing casts that DuckDB pushes into the scan (e.g. BIGINT "
