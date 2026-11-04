@@ -43,6 +43,9 @@ std::ostream &operator<<(std::ostream &os, const FilterSpec &spec) {
     } else {
         os << "all";
     }
+    if (spec.lookup) {
+        os << ", bitmap " << spec.lut_min << " >> " << spec.shift << " @" << spec.lookup->base();
+    }
     if (spec.load_sel) {
         os << ", load_sel";
     }
@@ -54,7 +57,9 @@ std::ostream &operator<<(std::ostream &os, const FilterSpec &spec) {
 }
 
 void DecodeColumnChunkOperator::apply(libstf::stream_t stream, OasisContext &ctx) {
-    // The filter conf goes first: the hardware holds the chunk back until it has one.
+    // The filter conf goes first: the hardware holds the chunk back until it has one. A bitmap
+    // region reaches the tables with the first conf that looks it up. Only the dispatcher thread
+    // applies the flows, so it writes every region once and before any chunk reads it.
     if (ctx.has_filter_config()) {
         ctx.config<FilterConfig>()->enqueue(stream, filter_);
     } else if (!filter_.is_passthrough()) {

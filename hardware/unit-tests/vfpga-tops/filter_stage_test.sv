@@ -24,7 +24,8 @@ assign clk   = aclk;
 assign rst_n = aresetn;
 
 // -- Configuration -------------------------------------------------------------------------------
-// The StreamConfig gives the type of every chunk, the FilterConfig its filter conf.
+// The StreamConfig gives the type of every chunk, the FilterConfig its filter conf and the words of
+// the lookup tables.
 localparam STREAM_CONFIG_REGS = N_STRM_AXI > 2 ? N_STRM_AXI : 2;
 
 write_config_i write_configs[2](clk, rst_n);
@@ -57,6 +58,8 @@ StreamConfig #(
 );
 
 ready_valid_i #(filter_conf_t) filter_conf[N_STRM_AXI](clk, rst_n);
+logic                          filter_table_write_valid;
+filter_table_write_t           filter_table_write;
 FilterConfig #(
     .NUM_DECODERS(N_STRM_AXI)
 ) inst_filter_config (
@@ -66,7 +69,10 @@ FilterConfig #(
     .write_config(write_configs[1]),
     .read_config(read_configs[1]),
 
-    .out(filter_conf)
+    .out(filter_conf),
+
+    .table_write_valid(filter_table_write_valid),
+    .table_write(filter_table_write)
 );
 
 // -- One FilterStage per stream -------------------------------------------------------------------
@@ -104,6 +110,9 @@ for (genvar I = 0; I < N_STRM_AXI; I++) begin : gen_stages
         .rst_n(rst_n),
 
         .conf(filter_conf[I]),
+
+        .table_write_valid(filter_table_write_valid),
+        .table_write(filter_table_write),
 
         .in(in),
         .out(filtered)

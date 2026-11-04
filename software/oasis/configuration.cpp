@@ -33,14 +33,30 @@ void ReadReqConfig::enqueue_read(libstf::stream_t stream, size_t vaddr, size_t s
 
 const libstf::stream_t ReadReqConfig::num_streams() const { return num_streams_; }
 
-constexpr const uint32_t FILTER_LO_ADDR   = 0;
-constexpr const uint32_t FILTER_HI_ADDR   = 1;
-constexpr const uint32_t FILTER_CTRL_ADDR = 2;
+constexpr const uint32_t FILTER_LO_ADDR         = 0;
+constexpr const uint32_t FILTER_HI_ADDR         = 1;
+constexpr const uint32_t FILTER_CTRL_ADDR       = 2;
+constexpr const uint32_t FILTER_LUT_MIN_ADDR    = 3;
+constexpr const uint32_t FILTER_TABLE_ADDR_ADDR = 0;
+constexpr const uint32_t FILTER_TABLE_DATA_ADDR = 1;
+constexpr const uint32_t FILTER_TABLE_BITS_REG  = 4;
 
 FilterConfig::FilterConfig(std::shared_ptr<coyote::cThread> cthread, uint32_t addr_offset,
                            uint32_t num_regs)
     : Config(cthread, addr_offset, num_regs), num_decoders_(read_register(1).value()),
-      maximum_num_enqueued_confs_(read_register(2).value()), sel_rows_(read_register(3).value()) {}
+      maximum_num_enqueued_confs_(read_register(2).value()), sel_rows_(read_register(3).value()) {
+    // The address space tells the layout: a bitstream with the lookup table sizes it for four
+    // registers per decoder and the two table registers.
+    if (num_regs >= FILTER_CONFIG_REGS * num_decoders_ + FILTER_TABLE_REGS) {
+        regs_per_decoder_ = FILTER_CONFIG_REGS;
+        table_bits_       = read_register(FILTER_TABLE_BITS_REG).value();
+    } else {
+        regs_per_decoder_ = FILTER_CONFIG_REGS_NO_LOOKUP;
+        table_bits_       = 0;
+    }
+    table_words_.assign(table_bits_ / 64, 0);
+    table_known_.assign(table_bits_ / 64, false);
+}
 
 void FilterConfig::enqueue(libstf::stream_t decoder, const FilterSpec &spec) {
     if (decoder >= num_decoders_) {
@@ -55,11 +71,52 @@ void FilterConfig::enqueue(libstf::stream_t decoder, const FilterSpec &spec) {
     ctrl |= spec.load_sel ? FILTER_CTRL_LOAD_SEL : 0;
     ctrl |= spec.store_sel ? FILTER_CTRL_STORE_SEL : 0;
     ctrl |= spec.emit ? FILTER_CTRL_EMIT : 0;
+    if (spec.lookup) {
+        if (table_bits_ == 0 || !spec.compare || spec.negate || spec.shift > FILTER_LOOKUP_MAX_SHIFT) {
+            throw std::runtime_error("FilterSpec looks up a bitmap that the FilterStage cannot take");
+        }
+        ctrl |= FILTER_CTRL_LOOKUP;
+        ctrl |= static_cast<uint64_t>(spec.shift) << FILTER_CTRL_SHIFT_BIT;
+        ctrl |= static_cast<uint64_t>(spec.lookup->base()) << FILTER_CTRL_BASE_BIT;
+        if (!spec.lookup->written) {
+            write_table(spec.lookup->base(), spec.lookup->words());
+            spec.lookup->written = true;
+        }
+    }
 
-    auto reg_offset = decoder * FILTER_CONFIG_REGS;
+    auto reg_offset = decoder * regs_per_decoder_;
     write_register(libstf::ConfigRegister(reg_offset + FILTER_LO_ADDR, static_cast<uint64_t>(spec.lo)));
     write_register(libstf::ConfigRegister(reg_offset + FILTER_HI_ADDR, static_cast<uint64_t>(spec.hi)));
     write_register(libstf::ConfigRegister(reg_offset + FILTER_CTRL_ADDR, ctrl));
+    if (regs_per_decoder_ == FILTER_CONFIG_REGS) {
+        write_register(libstf::ConfigRegister(reg_offset + FILTER_LUT_MIN_ADDR,
+                                              static_cast<uint64_t>(spec.lut_min)));
+    }
+}
+
+void FilterConfig::write_table(size_t base, const std::vector<uint64_t> &words) {
+    if (base + words.size() > table_bits_ / 64) {
+        throw std::runtime_error("lookup table region [" + std::to_string(base) + ", " +
+                                 std::to_string(base + words.size()) + ") exceeds the " +
+                                 std::to_string(table_bits_ / 64) + " words of the table");
+    }
+
+    // The address advances with every data write, so a run of changed words takes one address write
+    auto   reg_offset = num_decoders_ * regs_per_decoder_;
+    size_t next_addr  = table_words_.size();
+    for (size_t i = 0; i < words.size(); i++) {
+        auto addr = base + i;
+        if (table_known_[addr] && table_words_[addr] == words[i]) {
+            continue;
+        }
+        if (addr != next_addr) {
+            write_register(libstf::ConfigRegister(reg_offset + FILTER_TABLE_ADDR_ADDR, addr));
+        }
+        write_register(libstf::ConfigRegister(reg_offset + FILTER_TABLE_DATA_ADDR, words[i]));
+        table_words_[addr] = words[i];
+        table_known_[addr] = true;
+        next_addr          = addr + 1;
+    }
 }
 
 const libstf::stream_t FilterConfig::num_decoders() const { return num_decoders_; }
@@ -69,6 +126,8 @@ const size_t FilterConfig::maximum_num_enqueued_confs() const {
 }
 
 const size_t FilterConfig::sel_rows() const { return sel_rows_; }
+
+const size_t FilterConfig::table_bits() const { return table_bits_; }
 
 GenericConfig::GenericConfig(std::shared_ptr<coyote::cThread> cthread, uint32_t addr_offset,
                              uint32_t num_regs)

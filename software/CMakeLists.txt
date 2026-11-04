@@ -46,6 +46,7 @@ add_library(oasis SHARED)
 
 target_sources(oasis PRIVATE
     oasis/configuration.cpp
+    oasis/filter_table.cpp
     oasis/oasis_context.cpp
     oasis/operator.cpp
     oasis/scheduler.cpp

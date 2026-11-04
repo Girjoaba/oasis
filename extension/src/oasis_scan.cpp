@@ -303,18 +303,21 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
 
 	// Merge in the dynamic join filters, which did not exist yet when the global state was
 	// created at schedule time. The build side has completed by now (pipeline dependency), so the
-	// set is final. call_once publishes gstate.filters to every worker before it builds its
+	// set is final, and what the hardware takes of it is classified here, once per scan. call_once
+	// publishes gstate.filters and gstate.hw_filters to every worker before it builds its
 	// per-worker filter states below.
 	std::call_once(gstate.dynamic_filter_merge, [&]() {
-		if (!gstate.physical_scan) {
-			return;
-		}
-		auto &dynamic_filters = gstate.physical_scan->dynamic_filters;
-		if (dynamic_filters && dynamic_filters->HasFilters()) {
-			gstate.merged_filters = dynamic_filters->GetFinalTableFilters(*gstate.physical_scan, gstate.filters);
-			if (gstate.merged_filters) {
-				gstate.filters = gstate.merged_filters.get();
+		if (gstate.physical_scan) {
+			auto &dynamic_filters = gstate.physical_scan->dynamic_filters;
+			if (dynamic_filters && dynamic_filters->HasFilters()) {
+				gstate.merged_filters = dynamic_filters->GetFinalTableFilters(*gstate.physical_scan, gstate.filters);
+				if (gstate.merged_filters) {
+					gstate.filters = gstate.merged_filters.get();
+				}
 			}
+		}
+		if (gstate.hw_filter && gstate.filters) {
+			gstate.hw_filters = ClassifyHardwareFilters(context.client, gstate, bind_data);
 		}
 	});
 
@@ -354,8 +357,9 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
 	// owned by this worker), splitting top-level ANDs into per-conjunct filters (BuildScanFilters).
 	if (gstate.filters) {
 		BuildScanFilters(context.client, *gstate.filters, gstate, bind_data, lstate->scan_filters);
-		if (gstate.hw_filter) {
-			ClassifyHardwareFilters(context.client, gstate, bind_data, lstate->scan_filters);
+		D_ASSERT(gstate.hw_filters.empty() || gstate.hw_filters.size() == lstate->scan_filters.size());
+		for (size_t f = 0; f < gstate.hw_filters.size(); f++) {
+			lstate->scan_filters[f].hw = gstate.hw_filters[f];
 		}
 	}
 

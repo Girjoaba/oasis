@@ -10,6 +10,9 @@
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/table_filter_functions.hpp"
 #include "duckdb/storage/statistics/numeric_stats.hpp"
+#include "filter_pushdown.hpp"
+#include "hw_bitmap.hpp"
+#include "oasis/configuration.hpp"
 #include "parquet_reader.hpp"
 
 #include <algorithm>
@@ -98,8 +101,7 @@ static HwInterval Intersect(const HwInterval &a, const HwInterval &b) {
 	return result.lo <= result.hi ? result : EMPTY_INTERVAL;
 }
 
-// The stored integer of a constant of the scan type.
-static std::optional<int64_t> StoredConstant(const Expression &constant, const LogicalType &scan_type) {
+std::optional<int64_t> StoredConstant(const Expression &constant, const LogicalType &scan_type) {
 	if (constant.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
 		return std::nullopt;
 	}
@@ -153,37 +155,55 @@ static std::optional<HwInterval> ConstantInterval(const Expression &expr, const 
 	return std::nullopt;
 }
 
-// Fills hw_interval and hw_optional of a scan filter on a hardware column. The hardware takes a
-// comparison of the column with a constant: a constant filter of the query, the one-key equality of a
-// hash join, and the min/max bounds of a hash join, which come as an optional or selectivity-optional
-// filter around such a comparison. Everything else stays on the CPU: the dynamic (top-N), bloom and
-// prefix range filters, IN, OR, LIKE, a type the hardware does not compare and a column a pushed cast
-// narrowed. Independent of the row group.
-static void ClassifyHardwareFilter(OasisScanFilter &filter, const ProjectedColumn &col, const LogicalType &scan_type,
-                                   libstf::type_t transfer_type) {
+// What the hardware takes of a scan filter on a hardware column. The hardware
+// takes a comparison of the column with a constant: a constant filter of the query, the one-key
+// equality of a hash join, and the min/max bounds of a hash join, which come as an optional or
+// selectivity-optional filter around such a comparison. It looks the values up in a bitmap for the
+// prefix range filter of a hash join (selectivity-optional) and for an IN list of constants. DuckDB
+// pushes an IN list that is not a dense range as an optional filter, for the statistics, and keeps
+// the IN itself above the scan (the constant IN of the query) or checks the rows in the join (the IN
+// list of a hash join), so the hardware may pass a superset: both bitmaps fold when their span does
+// not fit. Everything else stays on the CPU: the dynamic (top-N) and bloom filters, OR, LIKE, a type
+// the hardware does not compare and a column a pushed cast narrowed. Independent of the row group.
+static HwScanFilter ClassifyHardwareFilter(oasis::FilterTable &table, const OasisScanFilter &filter,
+                                           const ProjectedColumn &col, const LogicalType &scan_type,
+                                           libstf::type_t transfer_type) {
+	HwScanFilter hw;
 	// A column a cast narrowed, or a filter rebound to the narrow type, keeps its filters on the CPU
 	if (col.cast_type || filter.row_filter || !filter.prune_on_stats) {
-		return;
+		return hw;
 	}
 	if (!HwFilterCompareType(transfer_type)) {
-		return;
+		return hw;
 	}
 	if (filter.filter.filter_type != TableFilterType::EXPRESSION_FILTER) {
-		return;
+		return hw;
 	}
 	auto &expr_filter = filter.filter.Cast<ExpressionFilter>();
 	if (!expr_filter.column_indexes.empty() || !expr_filter.expr) {
-		return; // Multi-column filter
+		return hw; // Multi-column filter
 	}
 	const auto &expr = *expr_filter.expr;
-	// The min/max bounds of a join: optional, so the hardware may drop the rows outside or keep them
+	auto classify = [&](const Expression &e, bool optional) {
+		hw.interval = ConstantInterval(e, scan_type);
+		if (hw.interval) {
+			return;
+		}
+		if (auto bitmap = LookupBitmap(table, e, scan_type, optional)) {
+			hw.interval = HwInterval {bitmap->min, bitmap->max, false};
+			hw.bitmap = bitmap->words.empty() ? nullptr : bitmap;
+		}
+	};
+	// The min/max bounds, the prefix range bitmap and the IN lists of a join, and the IN list of the
+	// query: optional, so the hardware may drop the rows outside or keep them.
 	auto join_bound = ExpressionFilter::GetOptionalFilterChild(expr);
 	if (join_bound) {
-		filter.hw_interval = ConstantInterval(*join_bound, scan_type);
-		filter.hw_optional = filter.hw_interval.has_value();
-		return;
+		classify(*join_bound, true);
+		hw.optional = hw.interval.has_value();
+		return hw;
 	}
-	filter.hw_interval = ConstantInterval(expr, scan_type);
+	classify(expr, false);
+	return hw;
 }
 
 // The type the decoder emits for the column before any narrowing of a chunk.
@@ -191,22 +211,32 @@ static libstf::type_t TransferType(const OasisScanBindData &bind, const Projecte
 	return col.cast_type.value_or(bind.metadata.groups[0].chunks[col.column_id].logical_type());
 }
 
-void ClassifyHardwareFilters(ClientContext &context, const OasisScanGlobalState &gstate, const OasisScanBindData &bind,
-                             std::vector<OasisScanFilter> &scan_filters) {
-	for (auto &filter : scan_filters) {
-		const auto &col = gstate.projected_columns[filter.filter_idx];
+std::vector<HwScanFilter> ClassifyHardwareFilters(ClientContext &context, const OasisScanGlobalState &gstate,
+                                                  const OasisScanBindData &bind) {
+	std::vector<OasisScanFilter> scan_filters;
+	BuildScanFilters(context, *gstate.filters, gstate, bind, scan_filters);
+	std::vector<HwScanFilter> hw_filters(scan_filters.size());
+	for (size_t f = 0; f < scan_filters.size(); f++) {
+		const auto &col = gstate.projected_columns[scan_filters[f].filter_idx];
 		if (col.is_cpu) {
 			continue;
 		}
 		const auto &scan_type = bind.output_types[col.column_id];
-		ClassifyHardwareFilter(filter, col, scan_type, TransferType(bind, col));
-		if (filter.hw_interval) {
+		auto &hw = hw_filters[f];
+		hw = ClassifyHardwareFilter(gstate.ctx->filter_table(), scan_filters[f], col, scan_type, TransferType(bind, col));
+		if (hw.bitmap) {
+			const auto &bitmap = *hw.bitmap;
+			DUCKDB_LOG_DEBUG(context, "Hardware filter on column '%s': %sbitmap [%lld, %lld] >> %u, %llu words, %.3f set",
+			                 bind.metadata.column_names[col.column_id].c_str(), hw.optional ? "optional " : "",
+			                 (long long)bitmap.min, (long long)bitmap.max, bitmap.shift,
+			                 (unsigned long long)bitmap.words.size(), bitmap.OnesFraction(bitmap.min, bitmap.max));
+		} else if (hw.interval) {
 			DUCKDB_LOG_DEBUG(context, "Hardware filter on column '%s': %s%s[%lld, %lld]",
-			                 bind.metadata.column_names[col.column_id].c_str(), filter.hw_optional ? "join " : "",
-			                 filter.hw_interval->negate ? "not " : "", (long long)filter.hw_interval->lo,
-			                 (long long)filter.hw_interval->hi);
+			                 bind.metadata.column_names[col.column_id].c_str(), hw.optional ? "join " : "",
+			                 hw.interval->negate ? "not " : "", (long long)hw.interval->lo, (long long)hw.interval->hi);
 		}
 	}
+	return hw_filters;
 }
 
 // Clamps the interval to the 32 bit lane the hardware compares: the FilterCompare takes the low
@@ -241,24 +271,31 @@ static bool ChunkHasNoNulls(OasisScanLocalState &lstate, size_t group, const par
 	return stats && !stats->CanHaveNull();
 }
 
-// The share of the chunk's rows that pass the interval if the values spread evenly over the
-// [min, max] of the chunk statistics; 1 without statistics.
+// The share of the chunk's rows that pass the interval and the bitmap if the values spread evenly
+// over the [min, max] of the chunk statistics; 1 without statistics, or the share of set bits of the
+// bitmap in the interval.
 static double EstimatedPassFraction(OasisScanLocalState &lstate, size_t group, size_t column_id,
-                                    const HwInterval &interval) {
+                                    const HwInterval &interval, const HwBitmap *bitmap) {
+	auto bitmap_fraction = [&](const HwInterval &range) {
+		return bitmap && range.lo <= range.hi ? bitmap->OnesFraction(range.lo, range.hi) : 1;
+	};
 	auto stats = ChunkStats(lstate, group, column_id);
 	if (!stats || !NumericStats::HasMinMax(*stats)) {
-		return 1;
+		return bitmap_fraction(interval);
 	}
 	auto min = StoredValue(NumericStats::Min(*stats));
 	auto max = StoredValue(NumericStats::Max(*stats));
 	if (!min || !max || *min > *max) {
-		return 1;
+		return bitmap_fraction(interval);
 	}
 	const auto overlap = Intersect(HwInterval {interval.lo, interval.hi, false}, HwInterval {*min, *max, false});
 	const long double inside = overlap.lo <= overlap.hi
 	                               ? ((long double)overlap.hi - overlap.lo + 1) / ((long double)*max - *min + 1)
 	                               : 0;
-	return double(interval.negate ? 1 - inside : inside);
+	if (interval.negate) {
+		return double(1 - inside);
+	}
+	return double(inside) * bitmap_fraction(overlap);
 }
 
 // The FilterSpec as text, for the debug log (formatted only when the log is on).
@@ -280,6 +317,7 @@ bool PlanHardwareFilter(ClientContext &context, const OasisScanGlobalState &gsta
 	// one of them is required by DuckDB, i.e. not an optional join bound. Only a required conjunct saves
 	// filter time on the CPU.
 	std::vector<std::optional<HwInterval>> intervals(num_hw);
+	std::vector<std::shared_ptr<const HwBitmap>> bitmaps(num_hw);
 	std::vector<std::vector<size_t>> taken(num_hw);
 	std::vector<bool> takes_required(num_hw, false);
 	for (size_t k = 0; k < num_hw; k++) {
@@ -291,7 +329,7 @@ bool PlanHardwareFilter(ClientContext &context, const OasisScanGlobalState &gsta
 		std::vector<size_t> candidates;
 		for (size_t f = 0; f < lstate.scan_filters.size(); f++) {
 			const auto &filter = lstate.scan_filters[f];
-			if (filter.filter_idx == i && filter.hw_interval && pending.needs_row_filter[f]) {
+			if (filter.filter_idx == i && filter.hw.interval && pending.needs_row_filter[f]) {
 				candidates.push_back(f);
 			}
 		}
@@ -299,19 +337,35 @@ bool PlanHardwareFilter(ClientContext &context, const OasisScanGlobalState &gsta
 			continue;
 		}
 		// One negated interval goes as it is; next to other conjuncts it stays on the CPU, since the
-		// hardware takes one interval per column
+		// hardware takes one interval per column. Likewise one bitmap per column; a 32 bit lane takes
+		// the difference to its min in 32 bits, so its span has to fit. The bitmap of a required
+		// conjunct needs its region now, else the conjunct stays on the CPU.
 		std::optional<HwInterval> interval;
 		for (size_t f : candidates) {
-			const auto &candidate = *lstate.scan_filters[f].hw_interval;
+			const auto &hw = lstate.scan_filters[f].hw;
+			const auto &candidate = *hw.interval;
 			if (candidate.negate && candidates.size() > 1) {
 				continue;
 			}
+			if (hw.bitmap && (bitmaps[k] || (lane32 && uint64_t(hw.bitmap->max) - uint64_t(hw.bitmap->min) > UINT32_MAX))) {
+				continue;
+			}
+			if (hw.bitmap && !hw.optional && !hw.bitmap->Region(gstate.ctx->filter_table())) {
+				continue;
+			}
 			interval = interval ? Intersect(*interval, candidate) : candidate;
+			if (hw.bitmap) {
+				bitmaps[k] = hw.bitmap;
+			}
 			taken[k].push_back(f);
-			takes_required[k] = takes_required[k] || !lstate.scan_filters[f].hw_optional;
+			takes_required[k] = takes_required[k] || !hw.optional;
 		}
 		if (interval) {
 			intervals[k] = FitToLane(*interval, lane32);
+			// No value passes, so no lookup
+			if (intervals[k]->lo > intervals[k]->hi) {
+				bitmaps[k].reset();
+			}
 		}
 	}
 
@@ -351,6 +405,7 @@ bool PlanHardwareFilter(ClientContext &context, const OasisScanGlobalState &gsta
 		}
 		if (hw_emit[pending.hw_slot[k]] && k != *compare_emitted) {
 			intervals[k].reset();
+			bitmaps[k].reset();
 			taken[k].clear();
 			continue;
 		}
@@ -368,8 +423,8 @@ bool PlanHardwareFilter(ClientContext &context, const OasisScanGlobalState &gsta
 		for (size_t k = 0; k < num_hw; k++) {
 			if (intervals[k]) {
 				const size_t column_id = gstate.projected_columns[pending.hw_slot[k]].column_id;
-				pass_fraction =
-				    std::min(pass_fraction, EstimatedPassFraction(lstate, pending.group, column_id, *intervals[k]));
+				pass_fraction = std::min(pass_fraction, EstimatedPassFraction(lstate, pending.group, column_id,
+				                                                              *intervals[k], bitmaps[k].get()));
 			}
 		}
 		float threshold;
@@ -432,6 +487,14 @@ bool PlanHardwareFilter(ClientContext &context, const OasisScanGlobalState &gsta
 			spec.lo = intervals[k]->lo;
 			spec.hi = intervals[k]->hi;
 			spec.store_sel = true;
+		}
+		// An optional bitmap without room in the table leaves the interval alone, a superset
+		if (bitmaps[k]) {
+			spec.lookup = bitmaps[k]->Region(gstate.ctx->filter_table());
+		}
+		if (spec.lookup) {
+			spec.lut_min = bitmaps[k]->min;
+			spec.shift = bitmaps[k]->shift;
 		}
 		spec.load_sel = k != order.front();
 		spec.emit = hw_emit[pending.hw_slot[k]];

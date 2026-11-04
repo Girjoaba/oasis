@@ -51,6 +51,8 @@ ready_valid_i #(read_req_t)          read_conf[NUM_STREAMS](.*);
 logic [PID_BITS-1:0]                 read_ctid[NUM_STREAMS];
 ready_valid_i #(column_chunk_conf_t) column_chunk_conf[NUM_DECODERS](.*);
 ready_valid_i #(filter_conf_t)       filter_conf[NUM_DECODERS](.*);
+logic                                filter_table_write_valid;
+filter_table_write_t                 filter_table_write;
 decoder_profile_i                    decoder_profiles[NUM_DECODERS]();
 
 GlobalConfig #(
@@ -124,7 +126,10 @@ FilterConfig #(
     .write_config(write_configs[3]),
     .read_config(read_configs[3]),
 
-    .out(filter_conf)
+    .out(filter_conf),
+
+    .table_write_valid(filter_table_write_valid),
+    .table_write(filter_table_write)
 );
 
 // -- Arbiter the read send queue ------------------------------------------------------------------
@@ -209,6 +214,9 @@ for (genvar I = 0; I < NUM_DECODERS; I++) begin : gen_decoders
         .rst_n(rst_n),
 
         .conf(filter_conf[I]),
+
+        .table_write_valid(filter_table_write_valid),
+        .table_write(filter_table_write),
 
         .in(typed_out),
         .out(out)

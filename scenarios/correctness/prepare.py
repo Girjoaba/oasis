@@ -113,6 +113,15 @@ DUCKDB_FILES: Dict[str, Tuple[str, str]] = {
     # One row group with more rows than the selection bitmap of the FilterStage holds (2**17).
     "e_big_rg": ("SELECT i::INTEGER AS c_id, (i * 31 % 1000)::INTEGER AS c_val FROM range(200000) r(i)",
                  ", ROW_GROUP_SIZE 200000"),
+    # Hardware lookup: join keys for the prefix range bitmaps of DuckDB, INT32 and INT64 with small
+    # spans, and c_kwide in blocks of 64 keys 4096 apart, whose span the lookup table holds only
+    # folded and whose chunks narrow to INT32.
+    "e_prf": (f"""
+        SELECT i::INTEGER AS c_id, (i * 3)::INTEGER AS c_k32,
+               (1000000000000 + i::BIGINT * 5)::BIGINT AS c_k64,
+               ((i // 64)::BIGINT * 4096 + i % 64)::BIGINT AS c_kwide,
+               (i * 31 % 1000)::INTEGER AS c_val, (i * 0.5)::DOUBLE AS c_double
+        FROM range({MANY_RG_ROWS}) r(i)""", f", ROW_GROUP_SIZE {RG}"),
     # Known gaps.
     "g_nulls": ("""
         SELECT i::INTEGER AS c_id,
@@ -249,6 +258,37 @@ CASES: Dict[str, str] = {
     "hwf_join_ineq": """SELECT a.c_id, count(*) AS n FROM {e_filter} a
                         JOIN (SELECT c_id FROM {e_filter} WHERE c_double BETWEEN 3000 AND 3150) b ON a.c_id < b.c_id
                         GROUP BY a.c_id""",
+    # Prefix range bitmap of a hash join (one key, many build keys): the hardware looks the probe keys up.
+    "hwf_prf_i32": """SELECT a.c_id, a.c_val FROM {e_prf} a
+                      JOIN (SELECT c_k32 FROM {e_prf} WHERE c_val < 150 AND c_id < 6000) b ON a.c_k32 = b.c_k32""",
+    "hwf_prf_i64": """SELECT a.c_id, a.c_val FROM {e_prf} a
+                      JOIN (SELECT c_k64 FROM {e_prf} WHERE c_val < 150 AND c_id < 6000) b ON a.c_k64 = b.c_k64""",
+    # The span is larger than a region: the bitmap folds 4 keys into a bit, the join drops the extra rows.
+    "hwf_prf_fold": """SELECT a.c_id, a.c_kwide FROM {e_prf} a
+                       JOIN (SELECT c_kwide FROM {e_prf} WHERE c_id % 5 = 0) b ON a.c_kwide = b.c_kwide""",
+    # Two bitmaps on two emitted keys: one is looked up, the other stays on the CPU.
+    "hwf_prf_two": """SELECT a.c_id FROM {e_prf} a
+                      JOIN (SELECT c_k32 FROM {e_prf} WHERE c_val < 300 AND c_id < 8000) b ON a.c_k32 = b.c_k32
+                      JOIN (SELECT c_k64 FROM {e_prf} WHERE c_val >= 200 AND c_id < 8000) c ON a.c_k64 = c.c_k64""",
+    # A constant on the key intersects with the [min, max] of the bitmap.
+    "hwf_prf_and_const": """SELECT a.c_id, a.c_k32 FROM {e_prf} a
+                            JOIN (SELECT c_k32 FROM {e_prf} WHERE c_val < 150 AND c_id < 6000) b ON a.c_k32 = b.c_k32
+                            WHERE a.c_k32 >= 9000""",
+    # A constant on a filter-only column, compared before the lookup of the emitted key.
+    "hwf_prf_const_other": """SELECT a.c_id, a.c_k32 FROM {e_prf} a
+                              JOIN (SELECT c_k32 FROM {e_prf} WHERE c_val < 150 AND c_id < 6000) b ON a.c_k32 = b.c_k32
+                              WHERE a.c_val < 500""",
+    # Every key of [min, max] is a build key: the interval alone.
+    "hwf_prf_dense": """SELECT a.c_id, a.c_val FROM {e_prf} a
+                        JOIN (SELECT c_id FROM {e_prf} WHERE c_double BETWEEN 1000 AND 1500) b ON a.c_id = b.c_id""",
+    # IN lists of constants: DuckDB keeps the IN above the scan and pushes it as an optional filter; the
+    # hardware looks the values up in a bitmap over their span.
+    "hwf_in_i32": "SELECT c_id, c_val FROM {e_prf} WHERE c_val IN (3, 77, 150, 151, 500, 999)",
+    "hwf_in_i64": """SELECT c_id, c_k64 FROM {e_prf}
+                     WHERE c_k64 IN (1000000000000, 1000000000005, 1000000050000, 1000000100010, 1000000100011)""",
+    "hwf_in_and_range": "SELECT c_id, c_val FROM {e_prf} WHERE c_val IN (3, 77, 150, 151, 500, 999) AND c_val > 100",
+    # The span of the values does not fit a region: the bitmap folds, the IN above the scan drops the rest.
+    "hwf_in_wide": "SELECT c_id FROM {e_prf} WHERE c_k64 IN (1000000000000, 1000000100000, 1001000000000, 1000000000005)",
 }
 
 # Known gaps (extension/test/README.md, "Known gaps", and the codecs and encodings ParCore lacks).

@@ -72,6 +72,7 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool)
     if (has_filter_config_) {
         sel_rows_ = config<FilterConfig>()->sel_rows();
     }
+    filter_table_ = std::make_shared<FilterTable>(has_filter_config_ ? config<FilterConfig>()->table_bits() : 0);
 
     // Pre-map huge pages to FPGA TLB
     auto *huge_pool = dynamic_cast<libstf::HugePageMemoryPool *>(memory_pool_.get());

@@ -47,6 +47,43 @@ struct HwInterval {
 	bool negate = false;
 };
 
+// A yes/no bitmap the FilterStage looks the values of a column up in (hw_bitmap.hpp): a value x with
+// min <= x <= max passes if bit (x - min) >> shift of `words` is set. The bitmap of a filter that is
+// not optional passes the values of the filter and no other; else it may pass a superset, as a folded
+// prefix range bitmap of a join, whose rows the join checks again.
+struct HwBitmap {
+	int64_t min;
+	int64_t max;
+	uint32_t shift;
+	std::vector<uint64_t> words;
+	// Set bits before each word, for OnesFraction.
+	std::vector<uint32_t> ones_before;
+
+	// The share of set bits among the bits of the values lo to hi, which lie in [min, max].
+	double OnesFraction(int64_t lo, int64_t hi) const;
+
+	// The region of the lookup table that holds the words, taken by the first row group that looks
+	// the bitmap up, so that a bitmap no group uses holds no room. Null when the table had no room
+	// then; every later call returns the same.
+	std::shared_ptr<oasis::FilterTableRegion> Region(oasis::FilterTable &table) const;
+
+private:
+	mutable std::once_flag region_allocated;
+	mutable std::shared_ptr<oasis::FilterTableRegion> region;
+};
+
+// What the hardware takes of one scan filter (hw_filter.hpp), the same for every worker and row group.
+struct HwScanFilter {
+	// The interval the hardware compares for this filter, if it is a comparison of the column with a
+	// constant the FilterStage can take.
+	std::optional<HwInterval> interval;
+	// Whether interval comes from an optional join filter (min/max or prefix range of a hash join).
+	bool optional = false;
+	// The bitmap the hardware looks the values up in, with interval its [min, max]: a prefix range
+	// filter of a hash join or an IN list. Null for a comparison.
+	std::shared_ptr<const HwBitmap> bitmap;
+};
+
 // Per-worker state for one pushed-down TableFilter. TableFilterState is not safe to share across
 // threads, so each worker owns its own (mirrors ParquetReader's per-scan-state scan_filters).
 struct OasisScanFilter {
@@ -75,11 +112,8 @@ struct OasisScanFilter {
 	unique_ptr<TableFilterState> filter_state;
 	// Whether `filter` takes the file type of the column, the type of the column chunk statistics.
 	bool prune_on_stats = true;
-	// The interval the hardware compares for this filter, if it is a comparison of the column with a
-	// constant the FilterStage can take (hw_filter.hpp). Set by ClassifyHardwareFilters.
-	std::optional<HwInterval> hw_interval;
-	// Whether hw_interval comes from an optional join filter (min/max of a hash join).
-	bool hw_optional = false;
+	// What the hardware takes of the filter, copied from gstate.hw_filters.
+	HwScanFilter hw;
 };
 
 struct OasisScanBindData : public TableFunctionData {
@@ -151,6 +185,11 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	optional_ptr<const PhysicalTableScan> physical_scan;
 	std::once_flag dynamic_filter_merge;
 	unique_ptr<TableFilterSet> merged_filters;
+
+	// What the hardware takes of each filter, one entry per filter of BuildScanFilters, in its order:
+	// classified once, after the dynamic filter merge (ClassifyHardwareFilters). The regions of the
+	// bitmaps return to the lookup table when the scan and its flows are done.
+	std::vector<HwScanFilter> hw_filters;
 
 	// Row-group cursor: the next group to hand out. Claimed atomically by workers.
 	std::atomic<size_t> next_group {0};

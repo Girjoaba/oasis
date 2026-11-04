@@ -2,6 +2,7 @@
 
 #include <libstf/buffer.hpp>
 #include <libstf/common.hpp>
+#include <oasis/filter_table.hpp>
 #include <parcore/metadata/metadata.hpp>
 
 #include <cstdint>
@@ -78,9 +79,12 @@ class LocalSourceOperator final : public SourceOperator {
 /**
  * What the FilterStage of the decoder does with one column chunk (filter_conf_t in hardware). A
  * value passes if lo <= x <= hi (signed, on the type the decoder emits; INT32 compares the low 32
- * bits), or if not with negate. Without compare every value passes. load_sel ANDs the selection
- * bitmap of the decoder (the pass bits of the previous filter columns of the row group) into the
- * pass bits, store_sel writes the result back. Without emit the output of the chunk is empty.
+ * bits), or if not with negate. Without compare every value passes. With a lookup region a value
+ * also needs its bit (x - lut_min) >> shift of the region, the difference in the width of the
+ * value; lo and hi have to keep the bits inside the region, and the lookup needs compare without
+ * negate. load_sel ANDs the selection bitmap of the decoder (the pass bits of the previous filter
+ * columns of the row group) into the pass bits, store_sel writes the result back. Without emit the
+ * output of the chunk is empty.
  *
  * The default is a chunk without filter: every value is written to the host.
  */
@@ -92,6 +96,10 @@ struct FilterSpec {
     bool    emit      = true;
     int64_t lo        = std::numeric_limits<int64_t>::min();
     int64_t hi        = std::numeric_limits<int64_t>::max();
+
+    std::shared_ptr<FilterTableRegion> lookup;
+    int64_t                            lut_min = 0;
+    uint32_t                           shift   = 0;
 
     [[nodiscard]] bool is_passthrough() const {
         return !compare && !load_sel && !store_sel && emit;

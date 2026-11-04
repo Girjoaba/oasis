@@ -5,6 +5,7 @@
 #include "libstf/configuration.hpp"
 #include "libstf/memory_pool.hpp"
 #include "libstf/tlb_manager.hpp"
+#include "oasis/filter_table.hpp"
 #include "oasis/scheduler.hpp"
 
 #include <atomic>
@@ -77,6 +78,11 @@ public:
     size_t sel_rows() const { return sel_rows_; }
 
     /**
+     * The regions of the lookup table of the FilterStages. Its bits are 0 without a lookup table.
+     */
+    FilterTable &filter_table() { return *filter_table_; }
+
+    /**
      * Whether an output stream without data takes its output buffer. The scheduler enqueues one
      * buffer per flow, so a flow that produces no bytes (a filtered chunk without passing values)
      * needs this to keep the buffers of the hardware and the software in step.
@@ -137,6 +143,7 @@ private:
     bool rdma_enabled_;
     bool has_filter_config_ = false;
     size_t sel_rows_ = 0;
+    std::shared_ptr<FilterTable> filter_table_;
     std::vector<std::shared_ptr<coyote::cThread>> rdma_cthreads_;
 
     std::unique_ptr<Scheduler> scheduler_;

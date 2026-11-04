@@ -84,7 +84,10 @@ FilterConfig #(
     .write_config(write_configs[1]),
     .read_config(read_configs[1]),
 
-    .out(filter_conf)
+    .out(filter_conf),
+
+    .table_write_valid(),
+    .table_write()
 );
 
 filter_conf_t conf;

@@ -20,16 +20,31 @@ typedef struct packed {
 // stage carries from its filter columns to its other columns (16 KiB of BRAM per decoder).
 parameter int FILTER_SEL_ROWS = 2 ** 17;
 
-// Per decoder three write registers (lo, hi, ctrl) and four read registers (ID, number of
-// decoders, FIFO depth, FILTER_SEL_ROWS). The GlobalConfig sizes both sides with one value.
-parameter int NUM_FILTER_CONFIG_WRITE_REGS = 3;
-parameter int NUM_FILTER_CONFIG_READ_REGS  = 4;
+// Bits of the lookup table of one FilterStage: the yes/no bitmaps of the lookup filters (the prefix
+// range filters of the joins and the IN lists), one region per bitmap, in 64 bit words. The host
+// writes the table once for all decoders, every decoder holds a copy (8 copies of 2 ** 14 words in
+// URAM per decoder for 2 ** 20 bits). 0 removes the lookup.
+`ifdef OASIS_FILTER_TABLE_BITS
+parameter int FILTER_TABLE_BITS = `OASIS_FILTER_TABLE_BITS;
+`else
+parameter int FILTER_TABLE_BITS = 2 ** 20;
+`endif
+parameter int FILTER_TABLE_WORDS     = FILTER_TABLE_BITS / 64;
+parameter int FILTER_TABLE_WORD_BITS = FILTER_TABLE_WORDS > 1 ? $clog2(FILTER_TABLE_WORDS) : 1;
+parameter int FILTER_TABLE_LATENCY   = 4; // Enabled cycles from the bit index to the bit
+
+// Per decoder four write registers (lo, hi, ctrl, lut_min), then two write registers of the table
+// (table_addr, table_data). Five read registers (ID, number of decoders, FIFO depth,
+// FILTER_SEL_ROWS, FILTER_TABLE_BITS). The GlobalConfig sizes both sides with one value.
+parameter int NUM_FILTER_CONFIG_WRITE_REGS = 4;
+parameter int NUM_FILTER_TABLE_WRITE_REGS  = 2;
+parameter int NUM_FILTER_CONFIG_READ_REGS  = 5;
 parameter int MAX_NUM_ENQUEUED_FILTER_CONFS = 64;
 parameter longint unsigned FILTER_CONFIG_ID = 64'h14e8418192d46a72;
 
 function automatic int FILTER_CONFIG_REGS(input int num_decoders);
-    return NUM_FILTER_CONFIG_WRITE_REGS * num_decoders > NUM_FILTER_CONFIG_READ_REGS ?
-           NUM_FILTER_CONFIG_WRITE_REGS * num_decoders : NUM_FILTER_CONFIG_READ_REGS;
+    return NUM_FILTER_CONFIG_WRITE_REGS * num_decoders + NUM_FILTER_TABLE_WRITE_REGS > NUM_FILTER_CONFIG_READ_REGS ?
+           NUM_FILTER_CONFIG_WRITE_REGS * num_decoders + NUM_FILTER_TABLE_WRITE_REGS : NUM_FILTER_CONFIG_READ_REGS;
 endfunction
 
 // What the FilterStage does with one column chunk. The bits are the ctrl register of FilterConfig.
@@ -38,19 +53,34 @@ endfunction
 //              columns of the row group).
 //   store_sel: write the pass bits into the selection bitmap.
 //   emit:      write the passing values to the host. Without emit the output of the chunk is empty.
+//   lookup:    a value passes only if its bit in the lookup table is set: bit
+//              base * 64 + ((x - lut_min) >> shift), in the width of the value. Needs compare
+//              without negate, with lo and hi inside the region of the bitmap.
+// The bits 4 to 0 are compare to emit, bit 5 lookup, the bits 11 to 6 shift, 39 to 16 base.
 typedef struct packed {
-    logic compare;
-    logic negate;
-    logic load_sel;
-    logic store_sel;
-    logic emit;
+    logic[23:0] base; // Word of the region of the bitmap in the lookup table
+    logic[3:0]  reserved;
+    logic[5:0]  shift;
+    logic       lookup;
+    logic       compare;
+    logic       negate;
+    logic       load_sel;
+    logic       store_sel;
+    logic       emit;
 } filter_ctrl_t;
 
 typedef struct packed {
     filter_ctrl_t ctrl;
     data64_t      lo;
     data64_t      hi;
+    data64_t      lut_min;
 } filter_conf_t;
+
+// One word write into the lookup tables of all decoders.
+typedef struct packed {
+    logic[FILTER_TABLE_WORD_BITS - 1:0] addr;
+    data64_t                            data;
+} filter_table_write_t;
 
 // One 32 bit lane of the FilterCompact with the keep bits of its bytes, so that a partial last
 // lane of a BYTE or INT16 column survives the compaction unchanged.
