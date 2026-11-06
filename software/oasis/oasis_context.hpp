@@ -83,6 +83,11 @@ public:
     FilterTable &filter_table() { return *filter_table_; }
 
     /**
+     * Whether the FilterStages look values up in a Bloom filter of the lookup table.
+     */
+    bool filter_bloom() const { return filter_bloom_; }
+
+    /**
      * Whether an output stream without data takes its output buffer. The scheduler enqueues one
      * buffer per flow, so a flow that produces no bytes (a filtered chunk without passing values)
      * needs this to keep the buffers of the hardware and the software in step.
@@ -144,6 +149,7 @@ private:
     bool has_filter_config_ = false;
     size_t sel_rows_ = 0;
     std::shared_ptr<FilterTable> filter_table_;
+    bool filter_bloom_ = false;
     std::vector<std::shared_ptr<coyote::cThread>> rdma_cthreads_;
 
     std::unique_ptr<Scheduler> scheduler_;

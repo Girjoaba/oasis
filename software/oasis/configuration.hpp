@@ -57,8 +57,8 @@ class ReadReqConfig : public libstf::Config {
 
 // Per-decoder write registers: [0] lo, [1] hi, [2] ctrl, [3] lut_min; after them [0] table_addr,
 // [1] table_data. Read registers: [0] ID, [1] number of decoders, [2] FIFO depth, [3] rows of the
-// selection bitmap, [4] bits of the lookup table. A bitstream without lookup table has only lo, hi
-// and ctrl per decoder and the read registers 0 to 3.
+// selection bitmap, [4] bits of the lookup table, [5] features. A bitstream without lookup table
+// has only lo, hi and ctrl per decoder and the read registers 0 to 3.
 constexpr const uint64_t FILTER_CONFIG_REGS           = 4;
 constexpr const uint64_t FILTER_CONFIG_REGS_NO_LOOKUP = 3;
 constexpr const uint64_t FILTER_TABLE_REGS            = 2;
@@ -72,8 +72,13 @@ constexpr const uint64_t FILTER_CTRL_NEGATE      = 1u << 3;
 constexpr const uint64_t FILTER_CTRL_COMPARE     = 1u << 4;
 constexpr const uint64_t FILTER_CTRL_LOOKUP      = 1u << 5;
 constexpr const uint32_t FILTER_CTRL_SHIFT_BIT   = 6;  // 6 bits
+constexpr const uint64_t FILTER_CTRL_BLOOM       = 1u << 12;
+constexpr const uint64_t FILTER_CTRL_HASH64      = 1u << 13;
 constexpr const uint32_t FILTER_CTRL_BASE_BIT    = 16; // 24 bits
 constexpr const uint32_t FILTER_LOOKUP_MAX_SHIFT = 31;
+
+// The bits of the features register (read register 5).
+constexpr const uint64_t FILTER_FEATURE_BLOOM = 1u << 0;
 
 /**
  * Configures the FilterStage of each decoder: one FilterSpec per column chunk.
@@ -107,6 +112,11 @@ class FilterConfig : public libstf::Config {
     const size_t table_bits() const;
 
     /**
+     * Whether the FilterStages look values up in a Bloom filter of the lookup table (FilterSpec::bloom).
+     */
+    const bool supports_bloom() const;
+
+    /**
      * Writes `words` into the lookup tables of all decoders, from word `base` on. The writes take
      * effect before every FilterSpec enqueued after them, so a chunk that looks the words up has to
      * be enqueued after this call, and no chunk in flight may look up the old words. Only the words
@@ -123,6 +133,7 @@ class FilterConfig : public libstf::Config {
     size_t           sel_rows_;
     uint64_t         regs_per_decoder_;
     size_t           table_bits_;
+    bool             bloom_;
 
     // The words of the tables as last written by write_table. A word is unknown until then: the
     // tables keep their contents from an earlier process and are not cleared.

@@ -163,13 +163,16 @@ static std::optional<HwInterval> ConstantInterval(const Expression &expr, const 
 // pushes an IN list that is not a dense range as an optional filter, for the statistics, and keeps
 // the IN itself above the scan (the constant IN of the query) or checks the rows in the join (the IN
 // list of a hash join), so the hardware may pass a superset: both bitmaps fold when their span does
-// not fit. Everything else stays on the CPU: the dynamic (top-N) and bloom filters, OR, LIKE, a type
-// the hardware does not compare and a column a pushed cast narrowed. Independent of the row group.
-// The stage limits what the hardware takes: 1 the comparisons of the plan, 2 also those of the
-// joins (`dynamic`), 3 also the bitmaps.
-static HwScanFilter ClassifyHardwareFilter(oasis::FilterTable &table, const OasisScanFilter &filter,
-                                           const ProjectedColumn &col, const LogicalType &scan_type,
-                                           libstf::type_t transfer_type, uint64_t stage, bool dynamic) {
+// not fit. It looks the values up in a Bloom filter for the Bloom filter of a hash join
+// (selectivity-optional), folded to the table. Everything else stays on the CPU: the dynamic
+// (top-N) filters, OR, LIKE, a type the hardware does not compare and a column a pushed cast
+// narrowed. Independent of the row group. The stage limits what the hardware takes: 1 the
+// comparisons of the plan, 2 also those of the joins (`dynamic`), 3 also the bitmaps, 5 also the
+// Bloom filters (`bloom`, with a bitstream that takes them).
+static HwScanFilter ClassifyHardwareFilter(ClientContext &context, oasis::FilterTable &table,
+                                           const OasisScanFilter &filter, const ProjectedColumn &col,
+                                           const LogicalType &scan_type, libstf::type_t transfer_type,
+                                           uint64_t stage, bool dynamic, bool bloom) {
 	HwScanFilter hw;
 	// A column a cast narrowed, or a filter rebound to the narrow type, keeps its filters on the CPU
 	if (col.cast_type || filter.row_filter || !filter.prune_on_stats) {
@@ -194,13 +197,13 @@ static HwScanFilter ClassifyHardwareFilter(oasis::FilterTable &table, const Oasi
 		if (hw.interval || stage < 3) {
 			return;
 		}
-		if (auto bitmap = LookupBitmap(table, e, scan_type, optional)) {
+		if (auto bitmap = LookupBitmap(context, table, e, scan_type, optional, bloom)) {
 			hw.interval = HwInterval {bitmap->min, bitmap->max, false};
 			hw.bitmap = bitmap->words.empty() ? nullptr : bitmap;
 		}
 	};
-	// The min/max bounds, the prefix range bitmap and the IN lists of a join, and the IN list of the
-	// query: optional, so the hardware may drop the rows outside or keep them.
+	// The min/max bounds, the prefix range bitmap, the Bloom filter and the IN lists of a join, and
+	// the IN list of the query: optional, so the hardware may drop the rows outside or keep them.
 	auto join_bound = ExpressionFilter::GetOptionalFilterChild(expr);
 	if (join_bound) {
 		classify(*join_bound, true);
@@ -236,6 +239,7 @@ std::vector<HwScanFilter> ClassifyHardwareFilters(ClientContext &context, const 
 			       filter.filter.Cast<ExpressionFilter>().Equals(other.filter.Cast<ExpressionFilter>());
 		});
 	};
+	const bool bloom = gstate.hw_filter_stage >= 5 && gstate.ctx->filter_bloom();
 	std::vector<HwScanFilter> hw_filters(scan_filters.size());
 	for (size_t f = 0; f < scan_filters.size(); f++) {
 		const auto &col = gstate.projected_columns[scan_filters[f].filter_idx];
@@ -245,14 +249,22 @@ std::vector<HwScanFilter> ClassifyHardwareFilters(ClientContext &context, const 
 		}
 		const auto &scan_type = bind.output_types[col.column_id];
 		auto &hw = hw_filters[f];
-		hw = ClassifyHardwareFilter(gstate.ctx->filter_table(), scan_filters[f], col, scan_type, TransferType(bind, col),
-		                            gstate.hw_filter_stage, !is_static(scan_filters[f]));
+		hw = ClassifyHardwareFilter(context, gstate.ctx->filter_table(), scan_filters[f], col, scan_type,
+		                            TransferType(bind, col), gstate.hw_filter_stage, !is_static(scan_filters[f]), bloom);
 		if (hw.bitmap) {
 			const auto &bitmap = *hw.bitmap;
-			DUCKDB_LOG_DEBUG(context, "Hardware filter on column '%s': %sbitmap [%lld, %lld] >> %u, %llu words, %.3f set",
-			                 bind.metadata.column_names[col.column_id].c_str(), hw.optional ? "optional " : "",
-			                 (long long)bitmap.min, (long long)bitmap.max, bitmap.shift,
-			                 (unsigned long long)bitmap.words.size(), bitmap.OnesFraction(bitmap.min, bitmap.max));
+			const auto &name = bind.metadata.column_names[col.column_id];
+			if (bitmap.bloom) {
+				DUCKDB_LOG_DEBUG(context,
+				                 "Hardware filter on column '%s': optional bloom [%lld, %lld], %llu words, %.0f keys, %.4f pass",
+				                 name.c_str(), (long long)bitmap.min, (long long)bitmap.max,
+				                 (unsigned long long)bitmap.words.size(), bitmap.bloom_keys, bitmap.bloom_pass);
+			} else {
+				DUCKDB_LOG_DEBUG(context, "Hardware filter on column '%s': %sbitmap [%lld, %lld] >> %u, %llu words, %.3f set",
+				                 name.c_str(), hw.optional ? "optional " : "", (long long)bitmap.min,
+				                 (long long)bitmap.max, bitmap.shift, (unsigned long long)bitmap.words.size(),
+				                 bitmap.OnesFraction(bitmap.min, bitmap.max));
+			}
 		} else if (hw.interval) {
 			DUCKDB_LOG_DEBUG(context, "Hardware filter on column '%s': %s%s[%lld, %lld]",
 			                 bind.metadata.column_names[col.column_id].c_str(), hw.optional ? "join " : "",
@@ -276,6 +288,14 @@ static HwInterval FitToLane(const HwInterval &interval, bool lane32) {
 	return HwInterval {std::max(interval.lo, lo), std::min(interval.hi, hi), interval.negate};
 }
 
+// Whether the interval passes every value of the lane.
+static bool PassesLane(const HwInterval &interval, bool lane32) {
+	const auto fit = FitToLane(interval, lane32);
+	const int64_t lo = lane32 ? NumericLimits<int32_t>::Minimum() : NumericLimits<int64_t>::Minimum();
+	const int64_t hi = lane32 ? NumericLimits<int32_t>::Maximum() : NumericLimits<int64_t>::Maximum();
+	return !fit.negate && fit.lo <= lo && fit.hi >= hi;
+}
+
 // The statistics of the column chunk in the group, or null without statistics.
 static unique_ptr<BaseStatistics> ChunkStats(OasisScanLocalState &lstate, size_t group, size_t column_id) {
 	const auto &pq_columns = lstate.parquet_reader->GetFileMetadata()->row_groups[group].columns;
@@ -295,12 +315,16 @@ static bool ChunkHasNoNulls(OasisScanLocalState &lstate, size_t group, const par
 }
 
 // The share of the chunk's rows that pass the interval and the bitmap if the values spread evenly
-// over the [min, max] of the chunk statistics; 1 without statistics, or the share of set bits of the
-// bitmap in the interval.
+// over the [min, max] of the chunk statistics; 1 without statistics, or the share of the values of
+// the interval that the bitmap passes. The keys of a Bloom filter spread evenly over the interval,
+// which holds the min/max bounds of its join when the hardware takes them too.
 static double EstimatedPassFraction(OasisScanLocalState &lstate, size_t group, size_t column_id,
                                     const HwInterval &interval, const HwBitmap *bitmap) {
 	auto bitmap_fraction = [&](const HwInterval &range) {
-		return bitmap && range.lo <= range.hi ? bitmap->OnesFraction(range.lo, range.hi) : 1;
+		if (bitmap && bitmap->bloom) {
+			return bitmap->PassFraction(interval.lo, interval.hi);
+		}
+		return bitmap && range.lo <= range.hi ? bitmap->PassFraction(range.lo, range.hi) : 1;
 	};
 	auto stats = ChunkStats(lstate, group, column_id);
 	if (!stats || !NumericStats::HasMinMax(*stats)) {
@@ -374,9 +398,11 @@ bool PlanHardwareFilter(ClientContext &context, const OasisScanGlobalState &gsta
 			continue;
 		}
 		// One negated interval goes as it is; next to other conjuncts it stays on the CPU, since the
-		// hardware takes one interval per column. Likewise one bitmap per column; a 32 bit lane takes
-		// the difference to its min in 32 bits, so its span has to fit. The bitmap of a required
-		// conjunct needs its region now, else the conjunct stays on the CPU.
+		// hardware takes one interval per column. Likewise one bitmap or Bloom filter per column; a
+		// 32 bit lane takes the difference to the min of a bitmap in 32 bits, so its span has to fit.
+		// The bitmap of a required conjunct needs its region now, else the conjunct stays on the CPU;
+		// so does the Bloom filter of a join, whose interval alone (the range of the type) passes every
+		// value. The Bloom filter of the keys of a prefix range filter keeps its [min, max], as a bitmap.
 		std::optional<HwInterval> interval;
 		for (size_t f : candidates) {
 			const auto &hw = lstate.scan_filters[f].hw;
@@ -384,10 +410,12 @@ bool PlanHardwareFilter(ClientContext &context, const OasisScanGlobalState &gsta
 			if (candidate.negate && candidates.size() > 1) {
 				continue;
 			}
-			if (hw.bitmap && (bitmaps[k] || (lane32 && uint64_t(hw.bitmap->max) - uint64_t(hw.bitmap->min) > UINT32_MAX))) {
+			if (hw.bitmap && (bitmaps[k] || (lane32 && !hw.bitmap->bloom &&
+			                                 uint64_t(hw.bitmap->max) - uint64_t(hw.bitmap->min) > UINT32_MAX))) {
 				continue;
 			}
-			if (hw.bitmap && !hw.optional && !hw.bitmap->Region(gstate.ctx->filter_table())) {
+			if (hw.bitmap && (!hw.optional || (hw.bitmap->bloom && PassesLane(candidate, lane32))) &&
+			    !hw.bitmap->Region(gstate.ctx->filter_table())) {
 				continue;
 			}
 			interval = interval ? Intersect(*interval, candidate) : candidate;
@@ -535,7 +563,12 @@ bool PlanHardwareFilter(ClientContext &context, const OasisScanGlobalState &gsta
 		if (bitmaps[k]) {
 			spec.lookup = bitmaps[k]->Region(gstate.ctx->filter_table());
 		}
-		if (spec.lookup) {
+		if (spec.lookup && bitmaps[k]->bloom) {
+			// The hash of DuckDB: of the 64 bit key of a BIGINT column also in a chunk narrowed to 32 bit lanes
+			const auto &col = gstate.projected_columns[pending.hw_slot[k]];
+			spec.bloom = true;
+			spec.hash64 = bind.output_types[col.column_id].InternalType() == PhysicalType::INT64;
+		} else if (spec.lookup) {
 			spec.lut_min = bitmaps[k]->min;
 			spec.shift = bitmaps[k]->shift;
 		}

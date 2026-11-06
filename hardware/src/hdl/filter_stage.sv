@@ -4,7 +4,7 @@
 
 /**
  * The filter of one decoder: compares the values of a column chunk against an interval, looks them
- * up in a bitmap, carries the selection of the row group across its column chunks and removes the
+ * up in a bitmap or a Bloom filter, carries the selection of the row group across its column chunks and removes the
  * unselected values before the output writer. One filter_conf_t per column chunk, in the order of the chunks, says what to do
  * (see filter_ctrl_t in the oasis package). The output of a chunk is its selected values as a
  * dense byte stream that ends with last, or a beat with keep 0 and last when no value is selected.

@@ -66,9 +66,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "oasis_hw_filter_stage",
 	    "The stages of the hardware filter read_oasis uses, each with the ones before: 0 none, 1 the constant "
 	    "comparisons of the query, 2 the bounds of the hash joins, 3 the bitmap lookup (prefix range filters, "
-	    "IN lists), 4 the dictionary-encoded string columns as their dictionary ids and their filters. Needs "
-	    "oasis_hw_filter; stage 4 needs decoders that emit the dictionary ids.",
-	    LogicalType::UBIGINT, Value::UBIGINT(4));
+	    "IN lists), 4 the dictionary-encoded string columns as their dictionary ids and their filters, 5 the "
+	    "Bloom filters of the hash joins and the prefix range filters too wide for the bitmap as Bloom filters "
+	    "of their keys. Needs oasis_hw_filter; the dictionary ids (4) need decoders that emit them, the Bloom "
+	    "filters (5) a FilterStage that takes Bloom filters.",
+	    LogicalType::UBIGINT, Value::UBIGINT(HW_FILTER_MAX_STAGE));
 	config.AddExtensionOption(
 	    "oasis_cast_pushdown",
 	    "Whether read_oasis accepts integer narrowing casts that DuckDB pushes into the scan (e.g. BIGINT "

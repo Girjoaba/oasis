@@ -31,14 +31,28 @@ parameter int FILTER_TABLE_BITS = 2 ** 20;
 `endif
 parameter int FILTER_TABLE_WORDS     = FILTER_TABLE_BITS / 64;
 parameter int FILTER_TABLE_WORD_BITS = FILTER_TABLE_WORDS > 1 ? $clog2(FILTER_TABLE_WORDS) : 1;
-parameter int FILTER_TABLE_LATENCY   = 4; // Enabled cycles from the bit index to the bit
+parameter int FILTER_TABLE_LATENCY   = 4; // Enabled cycles from the word and bit positions to the bit
+
+// Whether the FilterLookup also takes Bloom filters (the Bloom filters of the joins, as DuckDB builds
+// them): a MurmurHash64 of every value (FilterHash) in place of the range index, then the same table
+// read. Needs the lookup table. 0 removes the hash units (16 per decoder, two 64 bit multiplies each).
+`ifdef OASIS_FILTER_BLOOM
+parameter bit FILTER_BLOOM = `OASIS_FILTER_BLOOM;
+`else
+parameter bit FILTER_BLOOM = 1;
+`endif
+parameter int FILTER_HASH_MUL_STAGES = 4;                              // Registers after a multiply
+parameter int FILTER_HASH_LATENCY    = 2 * FILTER_HASH_MUL_STAGES + 3; // Enabled cycles from the value to its hash
+
+// The feature bits of read register 5 of the FilterConfig
+parameter int FILTER_FEATURE_BLOOM = 0;
 
 // Per decoder four write registers (lo, hi, ctrl, lut_min), then two write registers of the table
-// (table_addr, table_data). Five read registers (ID, number of decoders, FIFO depth,
-// FILTER_SEL_ROWS, FILTER_TABLE_BITS). The GlobalConfig sizes both sides with one value.
+// (table_addr, table_data). Six read registers (ID, number of decoders, FIFO depth,
+// FILTER_SEL_ROWS, FILTER_TABLE_BITS, features). The GlobalConfig sizes both sides with one value.
 parameter int NUM_FILTER_CONFIG_WRITE_REGS = 4;
 parameter int NUM_FILTER_TABLE_WRITE_REGS  = 2;
-parameter int NUM_FILTER_CONFIG_READ_REGS  = 5;
+parameter int NUM_FILTER_CONFIG_READ_REGS  = 6;
 parameter int MAX_NUM_ENQUEUED_FILTER_CONFS = 64;
 parameter longint unsigned FILTER_CONFIG_ID = 64'h14e8418192d46a72;
 
@@ -56,10 +70,19 @@ endfunction
 //   lookup:    a value passes only if its bit in the lookup table is set: bit
 //              base * 64 + ((x - lut_min) >> shift), in the width of the value. Needs compare
 //              without negate, with lo and hi inside the region of the bitmap.
-// The bits 4 to 0 are compare to emit, bit 5 lookup, the bits 11 to 6 shift, 39 to 16 base.
+//   bloom:     with lookup, the region holds a Bloom filter of 2 ** shift words, as DuckDB builds it:
+//              with h the MurmurHash64 of x, a value passes only if the bits h[37:32], h[45:40],
+//              h[53:48] and h[61:56] of word base + h[shift - 1:0] are set. Needs FILTER_BLOOM; the
+//              compare is optional.
+//   hash64:    the hash of an INT32 value is the hash of its 64 bit sign extension (a column of
+//              64 bit keys whose chunk the decoder narrowed), else of its 32 bit zero extension.
+// The bits 4 to 0 are compare to emit, bit 5 lookup, the bits 11 to 6 shift, bit 12 bloom, bit 13
+// hash64, the bits 39 to 16 base.
 typedef struct packed {
     logic[23:0] base; // Word of the region of the bitmap in the lookup table
-    logic[3:0]  reserved;
+    logic[1:0]  reserved;
+    logic       hash64;
+    logic       bloom;
     logic[5:0]  shift;
     logic       lookup;
     logic       compare;

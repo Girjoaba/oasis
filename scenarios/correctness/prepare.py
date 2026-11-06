@@ -42,6 +42,9 @@ NETWORK = {"model": "mock", "seed": 1,
 # Rows of e_many_rg: 10 full row groups of 2048 rows and a partial one.
 RG = 2048
 MANY_RG_ROWS = 10 * RG + 123
+# Rows of e_bloom_big: a build side of 60 000 keys gives a Bloom filter larger than half the lookup
+# table, and the build side has to stay below the probe side.
+BLOOM_BIG_ROWS = 64 * RG
 
 # DuckDB-written files: name -> (query, COPY options). DuckDB is the writer of the benchmark data.
 DUCKDB_FILES: Dict[str, Tuple[str, str]] = {
@@ -124,6 +127,20 @@ DUCKDB_FILES: Dict[str, Tuple[str, str]] = {
                ((i // 64)::BIGINT * 4096 + i % 64)::BIGINT AS c_kwide,
                (i * 31 % 1000)::INTEGER AS c_val, (i * 0.5)::DOUBLE AS c_double
         FROM range({MANY_RG_ROWS}) r(i)""", f", ROW_GROUP_SIZE {RG}"),
+    # Hardware Bloom filter: join keys whose span exceeds the 2^26 bits of DuckDB's prefix range
+    # filters, so a join with more keys than an IN list pushes a Bloom filter. c_k32 and c_kn have the
+    # same values of both signs as INTEGER and BIGINT (c_kn narrows to INT32 with
+    # oasis_narrow_transfer), c_k64 lies above 2^40.
+    "e_bloom": (f"""
+        SELECT i::INTEGER AS c_id, (i::BIGINT * 104729 % 2147483647 - 1073741824)::INTEGER AS c_k32,
+               (1000000000000 + i::BIGINT * 1000003)::BIGINT AS c_k64,
+               (i::BIGINT * 104729 % 2147483647 - 1073741824)::BIGINT AS c_kn,
+               (i * 31 % 1000)::INTEGER AS c_val
+        FROM range({MANY_RG_ROWS}) r(i)""", f", ROW_GROUP_SIZE {RG}"),
+    "e_bloom_big": (f"""
+        SELECT i::INTEGER AS c_id, (1000000000000 + i::BIGINT * 1000003)::BIGINT AS c_k64,
+               (i * 31 % 1000)::INTEGER AS c_val
+        FROM range({BLOOM_BIG_ROWS}) r(i)""", f", ROW_GROUP_SIZE {RG}"),
     # Hardware strings as their dictionary ids: low cardinality strings whose dictionary order changes
     # per row group (the first row of a group fixes it), empty and multi-byte strings, about 3 000
     # values (dictionaries of many words), c_gap with 'b' only in the odd row groups inside the [min,
@@ -280,6 +297,10 @@ CASES: Dict[str, str] = {
     # The span is larger than a region: the bitmap folds 4 keys into a bit, the join drops the extra rows.
     "hwf_prf_fold": """SELECT a.c_id, a.c_kwide FROM {e_prf} a
                        JOIN (SELECT c_kwide FROM {e_prf} WHERE c_id % 5 = 0) b ON a.c_kwide = b.c_kwide""",
+    # The keys fill the buckets of the folded bitmap, which then passes only the keys, fewer values than
+    # the Bloom filter of the keys: the folded bitmap is looked up.
+    "hwf_prf_cluster": """SELECT a.c_id, a.c_kwide FROM {e_prf} a
+                          JOIN (SELECT c_kwide FROM {e_prf} WHERE c_id % 64 < 32) b ON a.c_kwide = b.c_kwide""",
     # Two bitmaps on two emitted keys: one is looked up, the other stays on the CPU.
     "hwf_prf_two": """SELECT a.c_id FROM {e_prf} a
                       JOIN (SELECT c_k32 FROM {e_prf} WHERE c_val < 300 AND c_id < 8000) b ON a.c_k32 = b.c_k32
@@ -305,6 +326,25 @@ CASES: Dict[str, str] = {
     "hwf_in_wide": "SELECT c_id FROM {e_prf} WHERE c_k64 IN (1000000000000, 1000000100000, 1001000000000, 1000000000005)",
     # Strings as their dictionary ids: the conjuncts are evaluated over the dictionary of each row
     # group, the ids that pass go to the hardware as an interval, the interval negated or a bitmap.
+    # Bloom filters of the joins (stage 5): about 2 000 build keys, so DuckDB pushes the Bloom filter
+    # with the min/max bounds; 60 000 keys in e_bloom_big, whose filter folds to half the table.
+    "hwf_bf_i32": """SELECT a.c_id, a.c_val FROM {e_bloom} a
+                     JOIN (SELECT c_k32 FROM {e_bloom} WHERE c_val < 100) b ON a.c_k32 = b.c_k32""",
+    "hwf_bf_i64": """SELECT a.c_id, a.c_k64 FROM {e_bloom} a
+                     JOIN (SELECT c_k64 FROM {e_bloom} WHERE c_val < 100) b ON a.c_k64 = b.c_k64""",
+    "hwf_bf_kn": """SELECT a.c_id, a.c_val FROM {e_bloom} a
+                    JOIN (SELECT c_kn FROM {e_bloom} WHERE c_val < 100) b ON a.c_kn = b.c_kn""",
+    "hwf_bf_and_const": """SELECT a.c_id, a.c_k32 FROM {e_bloom} a
+                           JOIN (SELECT c_k32 FROM {e_bloom} WHERE c_val < 100) b ON a.c_k32 = b.c_k32
+                           WHERE a.c_k32 > 0""",
+    "hwf_bf_const_other": """SELECT a.c_id, a.c_k32 FROM {e_bloom} a
+                             JOIN (SELECT c_k32 FROM {e_bloom} WHERE c_val < 100) b ON a.c_k32 = b.c_k32
+                             WHERE a.c_val < 500""",
+    "hwf_bf_two": """SELECT a.c_id FROM {e_bloom} a
+                     JOIN (SELECT c_k32 FROM {e_bloom} WHERE c_val < 200) b ON a.c_k32 = b.c_k32
+                     JOIN (SELECT c_k64 FROM {e_bloom} WHERE c_val >= 100 AND c_val < 300) c ON a.c_k64 = c.c_k64""",
+    "hwf_bf_fold": """SELECT a.c_id, a.c_val FROM {e_bloom_big} a
+                      JOIN (SELECT c_k64 FROM {e_bloom_big} WHERE c_val < 460) b ON a.c_k64 = b.c_k64""",
     "hws_eq": "SELECT c_id, c_mode FROM {e_dict} WHERE c_mode = 'SHIP'",
     "hws_ne": "SELECT c_id, c_mode FROM {e_dict} WHERE c_mode <> 'SHIP'",
     "hws_range": "SELECT c_id, c_mode FROM {e_dict} WHERE c_mode < 'RAIL'",
@@ -337,18 +377,21 @@ CASES: Dict[str, str] = {
 # The cases of edge_stages, run at every oasis_hw_filter_stage: one or two per stage of the hardware
 # filter and every hws_* case.
 STAGE_CASES = ["hwf_mixed", "hwf_eq_first", "hwf_join_one_key_i32", "hwf_join_minmax", "hwf_join_ineq",
-               "hwf_prf_i32", "hwf_prf_fold", "hwf_in_i32", "hwf_in_wide"] + [c for c in CASES if c.startswith("hws_")]
-STAGES = range(5)
+               "hwf_prf_i32", "hwf_prf_fold", "hwf_in_i32", "hwf_in_wide", "hwf_bf_i32",
+               "hwf_bf_i64"] + [c for c in CASES if c.startswith("hws_")]
+STAGES = range(6)
 
 # The hardware filter messages of the log (duckdb_logs at DEBUG) and the first stage that may log them: no
 # stage uses a feature of a later one. A join bound comes from stage 2 on, a bitmap from stage 3, a
-# dictionary id column from stage 4, which must log one.
+# dictionary id column from stage 4 and a Bloom filter from stage 5; the last stage must log both.
 DICT_IDS_MESSAGE = "message LIKE '%as its dictionary ids%'"
+BLOOM_MESSAGE = "message LIKE 'Hardware filter on column%bloom%'"
 STAGE_LOG_CHECKS = {
     "no_hw": ("message LIKE 'Row group %: column%'", 1),
     "no_join": ("message LIKE 'Hardware filter on column%: join%'", 2),
     "no_bitmap": ("message LIKE 'Hardware filter on column%bitmap%'", 3),
     "no_dict_ids": (DICT_IDS_MESSAGE, 4),
+    "no_bloom": (BLOOM_MESSAGE, 5),
 }
 
 # Known gaps (extension/test/README.md, "Known gaps", and the codecs and encodings ParCore lacks).
@@ -437,7 +480,8 @@ def stages_sql(cases: Dict[str, str], files: List[str]) -> Tuple[str, List[str]]
                 true_keys.append(f"{key}_s{stage}")
         if stage == max(STAGES):
             lines.append(f"SELECT count(*) > 0 AS dict_ids_s{stage} FROM duckdb_logs WHERE {DICT_IDS_MESSAGE};\n")
-            true_keys.append(f"dict_ids_s{stage}")
+            lines.append(f"SELECT count(*) > 0 AS bloom_s{stage} FROM duckdb_logs WHERE {BLOOM_MESSAGE};\n")
+            true_keys += [f"dict_ids_s{stage}", f"bloom_s{stage}"]
     return "".join(lines) + FOOTER, true_keys
 
 

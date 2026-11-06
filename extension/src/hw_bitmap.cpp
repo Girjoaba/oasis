@@ -1,10 +1,12 @@
 #include "hw_bitmap.hpp"
 
 #include "duckdb/common/limits.hpp"
+#include "duckdb/common/types/hash.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/table_filter_functions.hpp"
+#include "hw_bloom.hpp"
 #include "hw_filter.hpp"
 #include "oasis/configuration.hpp"
 
@@ -16,9 +18,9 @@ namespace duckdb {
 static constexpr size_t BITMAP_TABLE_SHARE = 2;
 // A folded bitmap of an IN list takes at most this many bits: its few values set as many bits.
 static constexpr uint64_t FOLDED_IN_LIST_MAX_BITS = 4096;
-// A folded bitmap with more set bits than this share passes about as much as its [min, max]: the
-// interval goes to the hardware alone and the bitmap keeps no words.
-static constexpr double FOLDED_BITMAP_MAX_ONES = 0.9;
+// A prefix range filter that folds may go as a Bloom filter of its keys instead, if its span has at
+// most this many keys: the span of the exact prefix range filters of DuckDB (SMALL_EXACT_PRF_BITS).
+static constexpr uint64_t KEYS_BLOOM_MAX_SPAN = uint64_t(1) << 26;
 
 static uint64_t BitmapBits(int64_t min, int64_t max, uint32_t shift) {
 	return ((uint64_t(max) - uint64_t(min)) >> shift) + 1;
@@ -39,6 +41,14 @@ double HwBitmap::OnesFraction(int64_t lo, int64_t hi) const {
 	return double(ones_until(last + 1) - ones_until(first)) / double(last - first + 1);
 }
 
+double HwBitmap::PassFraction(int64_t lo, int64_t hi) const {
+	if (bloom) {
+		const double keys = std::min(1.0, bloom_keys / (double(uint64_t(hi) - uint64_t(lo)) + 1));
+		return keys + (1 - keys) * bloom_pass;
+	}
+	return words.empty() ? 1 : OnesFraction(lo, hi);
+}
+
 std::shared_ptr<oasis::FilterTableRegion> HwBitmap::Region(oasis::FilterTable &table) const {
 	std::call_once(region_allocated, [&]() { region = table.allocate(words); });
 	return region;
@@ -47,6 +57,12 @@ std::shared_ptr<oasis::FilterTableRegion> HwBitmap::Region(oasis::FilterTable &t
 // The largest bitmap a new region can hold now, in bits.
 static uint64_t BitmapBudget(oasis::FilterTable &table) {
 	return std::min(table.largest_free_words(), table.words() / BITMAP_TABLE_SHARE) * 64;
+}
+
+// The words of the largest Bloom filter a new region can hold now, a power of two; 0 for none.
+static uint64_t BloomWords(oasis::FilterTable &table) {
+	const uint64_t max_words = BitmapBudget(table) / 64;
+	return max_words == 0 ? 0 : PreviousPowerOfTwo(max_words);
 }
 
 // The smallest shift up to max_shift that fits the bitmap of [min, max] into budget bits.
@@ -87,13 +103,33 @@ std::shared_ptr<const HwBitmap> MakeBitmap(int64_t min, int64_t max, uint32_t sh
 	return bitmap;
 }
 
+// Calls found(i) for every key min + i, i < num_keys, of the prefix range filter.
+template <class T, class F>
+static void ForEachKey(const PrefixRangeFilter &prf, const LogicalType &key_type, int64_t min, uint64_t num_keys,
+                       F found) {
+	Vector keys(key_type, STANDARD_VECTOR_SIZE);
+	auto data = FlatVector::GetDataMutable<T>(keys);
+	SelectionVector sel(STANDARD_VECTOR_SIZE);
+	for (uint64_t start = 0; start < num_keys; start += STANDARD_VECTOR_SIZE) {
+		const idx_t count = idx_t(std::min<uint64_t>(STANDARD_VECTOR_SIZE, num_keys - start));
+		for (idx_t i = 0; i < count; i++) {
+			data[i] = T(uint64_t(min) + start + i);
+		}
+		const idx_t num_found = prf.LookupKeys(keys, sel, count);
+		for (idx_t i = 0; i < num_found; i++) {
+			found(start + sel.get_index(i));
+		}
+	}
+}
+
 // The bitmap of a prefix range filter of a hash join, rebuilt through its lookups: the smallest and
 // the largest key with a set bit by bisection, then the bit of every key of [min, max] (shift 0) or
 // whether any key of a bucket of 2^shift keys has its bit set, so the bitmap folds when [min, max]
-// does not fit. Not exact: the join checks the rows again.
+// does not fit. With bloom_words a filter that folds goes as the Bloom filter of its keys in at most
+// that many words instead, if that passes fewer values. Not exact: the join checks the rows again.
 template <class T>
 static std::shared_ptr<const HwBitmap> PrefixRangeBitmap(const PrefixRangeFilter &prf, const LogicalType &key_type,
-                                                         oasis::FilterTable &table) {
+                                                         oasis::FilterTable &table, uint64_t bloom_words) {
 	auto any = [&](int64_t lo, int64_t hi) {
 		return prf.LookupRange(Value::CreateValue(T(lo)), Value::CreateValue(T(hi))) !=
 		       FilterPropagateResult::FILTER_ALWAYS_FALSE;
@@ -128,19 +164,7 @@ static std::shared_ptr<const HwBitmap> PrefixRangeBitmap(const PrefixRangeFilter
 	const uint64_t num_bits = BitmapBits(min, max, shift);
 	std::vector<uint64_t> words((num_bits + 63) / 64, 0);
 	if (shift == 0) {
-		Vector keys(key_type, STANDARD_VECTOR_SIZE);
-		auto data = FlatVector::GetDataMutable<T>(keys);
-		SelectionVector found(STANDARD_VECTOR_SIZE);
-		for (uint64_t start = 0; start < num_bits; start += STANDARD_VECTOR_SIZE) {
-			const idx_t count = idx_t(std::min<uint64_t>(STANDARD_VECTOR_SIZE, num_bits - start));
-			for (idx_t i = 0; i < count; i++) {
-				data[i] = T(uint64_t(min) + start + i);
-			}
-			const idx_t num_found = prf.LookupKeys(keys, found, count);
-			for (idx_t i = 0; i < num_found; i++) {
-				SetBit(words, start + found.get_index(i));
-			}
-		}
+		ForEachKey<T>(prf, key_type, min, num_bits, [&](uint64_t bit) { SetBit(words, bit); });
 	} else {
 		// The keys of a span this wide are sparse: the buckets of a word are looked up only if the
 		// word has a key.
@@ -162,7 +186,24 @@ static std::shared_ptr<const HwBitmap> PrefixRangeBitmap(const PrefixRangeFilter
 			}
 		}
 	}
-	return MakeBitmap(min, max, shift, false, std::move(words));
+	auto folded = MakeBitmap(min, max, shift, false, std::move(words));
+	if (shift == 0 || bloom_words == 0 || uint64_t(max) - uint64_t(min) >= KEYS_BLOOM_MAX_SPAN) {
+		return folded;
+	}
+
+	// The keys go into the largest Bloom filter that fits, which KeysBloom folds to their number
+	std::vector<uint64_t> bloom_bits(bloom_words, 0);
+	uint64_t num_keys = 0;
+	ForEachKey<T>(prf, key_type, min, uint64_t(max) - uint64_t(min) + 1, [&](uint64_t i) {
+		BloomInsert(bloom_bits, Hash<T>(T(uint64_t(min) + i)));
+		num_keys++;
+	});
+	// The one that passes fewer values of [min, max]: the keys and the false positives of the Bloom filter
+	auto keys_bloom = KeysBloom(min, max, bloom_bits, num_keys);
+	if (keys_bloom && keys_bloom->PassFraction(min, max) < folded->PassFraction(min, max)) {
+		return keys_bloom;
+	}
+	return folded;
 }
 
 // The bitmap of `column IN (constants)` over the span of the stored values. An exact bitmap has to fit
@@ -195,23 +236,35 @@ static std::shared_ptr<const HwBitmap> InListBitmap(const BoundOperatorExpressio
 	return MakeBitmap(min, max, shift, exact, std::move(words));
 }
 
-std::shared_ptr<const HwBitmap> LookupBitmap(oasis::FilterTable &table, const Expression &expr,
-                                             const LogicalType &scan_type, bool optional) {
+std::shared_ptr<const HwBitmap> LookupBitmap(ClientContext &context, oasis::FilterTable &table, const Expression &expr,
+                                             const LogicalType &scan_type, bool optional, bool bloom) {
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
 		auto &func = expr.Cast<BoundFunctionExpression>();
-		if (func.Function().GetName() != PrefixRangeScalarFun::NAME || !func.BindInfo() ||
-		    !ExpressionFilter::IsSimpleFilterColumnRef(*func.GetChildren()[0])) {
+		const auto &name = func.Function().GetName();
+		if (!func.BindInfo() || !ExpressionFilter::IsSimpleFilterColumnRef(*func.GetChildren()[0])) {
 			return nullptr;
 		}
-		auto &data = func.BindInfo()->Cast<PrefixRangeFunctionData>();
-		if (!data.filter || data.key_type != scan_type) {
+		const auto physical = scan_type.InternalType();
+		if (physical != PhysicalType::INT32 && physical != PhysicalType::INT64) {
 			return nullptr;
 		}
-		if (scan_type.InternalType() == PhysicalType::INT32) {
-			return PrefixRangeBitmap<int32_t>(*data.filter, scan_type, table);
+		const uint64_t bloom_words = bloom ? BloomWords(table) : 0;
+		if (name == PrefixRangeScalarFun::NAME) {
+			auto &data = func.BindInfo()->Cast<PrefixRangeFunctionData>();
+			if (!data.filter || data.key_type != scan_type) {
+				return nullptr;
+			}
+			if (physical == PhysicalType::INT32) {
+				return PrefixRangeBitmap<int32_t>(*data.filter, scan_type, table, bloom_words);
+			}
+			return PrefixRangeBitmap<int64_t>(*data.filter, scan_type, table, bloom_words);
 		}
-		if (scan_type.InternalType() == PhysicalType::INT64) {
-			return PrefixRangeBitmap<int64_t>(*data.filter, scan_type, table);
+		if (name == BloomFilterScalarFun::NAME && bloom) {
+			auto &data = func.BindInfo()->Cast<BloomFilterFunctionData>();
+			if (!data.filter || data.key_type != scan_type) {
+				return nullptr;
+			}
+			return JoinBloom(context, *data.filter, scan_type, bloom_words);
 		}
 		return nullptr;
 	}

@@ -70,7 +70,8 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool)
     // The FilterStage is optional: a bitstream without it decodes without filter.
     has_filter_config_ = has_config<FilterConfig>();
     if (has_filter_config_) {
-        sel_rows_ = config<FilterConfig>()->sel_rows();
+        sel_rows_     = config<FilterConfig>()->sel_rows();
+        filter_bloom_ = config<FilterConfig>()->supports_bloom();
     }
     filter_table_ = std::make_shared<FilterTable>(has_filter_config_ ? config<FilterConfig>()->table_bits() : 0);
 

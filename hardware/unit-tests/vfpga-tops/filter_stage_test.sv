@@ -78,6 +78,8 @@ FilterConfig #(
 // -- One FilterStage per stream -------------------------------------------------------------------
 // Stream I takes the chunks of decoder I: AXI in, typed by the StreamConfig, through the FilterStage
 // and back to AXI. The host does not expect any data for empty chunks, so their null beat is dropped.
+// As in the StreamWriter, a null last beat after the data of a chunk first moves onto the beat before
+// it, so that only the null beat of an empty chunk is left to drop.
 // The output stalls 3 cycles in every 8, so that the beats queue up inside the stage.
 for (genvar I = 0; I < N_STRM_AXI; I++) begin : gen_stages
     AXI4S axi_in(.aclk(clk), .aresetn(rst_n));
@@ -139,11 +141,21 @@ for (genvar I = 0; I < N_STRM_AXI; I++) begin : gen_stages
 
     assign stall = stall_count < 3;
 
-    assign axis_host_send[I].tdata  = axi_out.tdata;
-    assign axis_host_send[I].tkeep  = axi_out.tkeep;
-    assign axis_host_send[I].tlast  = axi_out.tlast;
-    assign axis_host_send[I].tvalid = axi_out.tvalid && axi_out.tkeep != '0 && !stall;
-    assign axi_out.tready           = !stall && (axis_host_send[I].tready || (axi_out.tvalid && axi_out.tkeep == '0));
+    AXI4S axi_no_nulls(.aclk(clk), .aresetn(rst_n));
+    AXINullBeatSuppressor inst_null_beat_suppressor (
+        .clk(clk),
+        .rst_n(rst_n),
+
+        .in(axi_out),
+        .out(axi_no_nulls)
+    );
+
+    assign axis_host_send[I].tdata  = axi_no_nulls.tdata;
+    assign axis_host_send[I].tkeep  = axi_no_nulls.tkeep;
+    assign axis_host_send[I].tlast  = axi_no_nulls.tlast;
+    assign axis_host_send[I].tvalid = axi_no_nulls.tvalid && axi_no_nulls.tkeep != '0 && !stall;
+    assign axi_no_nulls.tready      = !stall && (axis_host_send[I].tready ||
+                                                 (axi_no_nulls.tvalid && axi_no_nulls.tkeep == '0));
 
 `ifndef SYNTHESIS
     // Every input chunk has to leave the stage as exactly one output stream, also an empty one.

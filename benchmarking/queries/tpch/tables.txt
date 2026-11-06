@@ -1,0 +1,8 @@
+lineitem
+orders
+customer
+part
+partsupp
+supplier
+nation
+region

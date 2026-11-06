@@ -20,7 +20,8 @@ import oasis::*;
  * may look up a word it writes.
  *
  * Read registers: the ID, the number of decoders, the FIFO depth, the rows of the selection bitmap
- * (FILTER_SEL_ROWS) and the bits of the lookup table (FILTER_TABLE_BITS). The host needs no
+ * (FILTER_SEL_ROWS), the bits of the lookup table (FILTER_TABLE_BITS) and the features (bit
+ * FILTER_FEATURE_BLOOM: the FilterLookup takes Bloom filters). The host needs no
  * handshake: the config writes take effect in order, so a region is in the tables before the
  * entries written after it.
  */
@@ -53,6 +54,7 @@ assign values[1] = NUM_DECODERS;
 assign values[2] = MAX_NUM_ENQUEUED_FILTER_CONFS;
 assign values[3] = FILTER_SEL_ROWS;
 assign values[4] = FILTER_TABLE_BITS;
+assign values[5] = AXIL_DATA_BITS'(FILTER_BLOOM && FILTER_TABLE_BITS > 0) << FILTER_FEATURE_BLOOM;
 
 ConfigReadRegisterFile #(
     .NUM_REGS(NUM_FILTER_CONFIG_READ_REGS)

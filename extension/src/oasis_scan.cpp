@@ -218,14 +218,15 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	context.TryGetCurrentSetting("oasis_hw_filter", hw_filter_val);
 	Value stage_val;
 	context.TryGetCurrentSetting("oasis_hw_filter_stage", stage_val);
-	const uint64_t stage = stage_val.IsNull() ? 4 : stage_val.GetValue<uint64_t>();
-	if (stage > 4) {
-		throw InvalidInputException("oasis_hw_filter_stage is %llu, it must be 0 to 4", (unsigned long long)stage);
+	const uint64_t stage = stage_val.IsNull() ? HW_FILTER_MAX_STAGE : stage_val.GetValue<uint64_t>();
+	if (stage > HW_FILTER_MAX_STAGE) {
+		throw InvalidInputException("oasis_hw_filter_stage is %llu, it must be 0 to %llu", (unsigned long long)stage,
+		                            (unsigned long long)HW_FILTER_MAX_STAGE);
 	}
 	const bool hw_filter_setting = (hw_filter_val.IsNull() || hw_filter_val.GetValue<bool>()) && stage > 0;
 	gstate->hw_filter_stage = hw_filter_setting ? stage : 0;
 
-	// Stage 4: a string column whose chunks are all dictionary-encoded goes to the decoders as its dictionary ids
+	// Dictionary ids (stage 4): a string column whose chunks are all dictionary-encoded goes to the decoders as its dictionary ids
 	const bool emit_ids_supported = gstate->hw_filter_stage >= 4 &&
 	                                ctx.has_config<parcore::ColumnChunkDecoderConfig>() &&
 	                                ctx.config<parcore::ColumnChunkDecoderConfig>()->supports_emit_ids();

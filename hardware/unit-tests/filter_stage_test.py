@@ -5,7 +5,8 @@ from coyote_test import fpga_stream
 
 from libstf_utils.configured_test_case import ConfiguredTestCase
 from libstf_utils.fpga_configuration import StreamConfig
-from oasis_utils.fpga_configuration import FilterConfig, INT32_MIN, INT32_MAX, INT64_MIN, INT64_MAX
+from oasis_utils.fpga_configuration import (FilterConfig, INT32_MIN, INT32_MAX, INT64_MIN, INT64_MAX, bloom_hash,
+                                            bloom_mask, bloom_words)
 
 INT32 = fpga_stream.StreamType.SIGNED_INT_32
 INT64 = fpga_stream.StreamType.SIGNED_INT_64
@@ -33,6 +34,8 @@ class Chunk:
     lut_min: int = 0
     shift: int = 0
     base: int = 0
+    bloom: bool = False
+    hash64: bool = False
 
 
 def bitmap_words(bits: list[bool]) -> list[int]:
@@ -51,13 +54,28 @@ def lookup_chunk(decoder: int, stream_type: fpga_stream.StreamType, values: list
                  lut_min=lo if lut_min is None else lut_min, **kwargs)
 
 
+def bloom_chunk(decoder: int, stream_type: fpga_stream.StreamType, values: list[int], num_words: int, base: int,
+                **kwargs) -> Chunk:
+    """A chunk that looks the values up in the Bloom filter of num_words words at word base."""
+    return Chunk(decoder, stream_type, values, lookup=True, bloom=True, shift=num_words.bit_length() - 1, base=base,
+                 **kwargs)
+
+
+def fold_words(words: list[int], num_words: int) -> list[int]:
+    """A Bloom filter halved to num_words words by OR of its halves, as DuckDB's BloomFilter::Fold."""
+    folded = [0] * num_words
+    for i, word in enumerate(words):
+        folded[i % num_words] |= word
+    return folded
+
+
 class FilterStageTestCase(ConfiguredTestCase):
     """
     Tests the FilterStage: the chunks of decoder I enter on stream I and leave on stream I without
     the values that fail the compare, the lookup or the selection of the row group, packed into full
     beats. A model of the selection bitmap per decoder and of the lookup table gives the expected
-    values; a chunk without expected values has no expected output because the host receives nothing
-    for an empty stream. The table regions are written before the confs, like the software writes a
+    values (the hash of DuckDB for a Bloom filter); a chunk without expected values has no expected
+    output because the host receives nothing for an empty stream. The table regions are written before the confs, like the software writes a
     region before the first chunk that looks it up.
     """
 
@@ -79,6 +97,7 @@ class FilterStageTestCase(ConfiguredTestCase):
                 chunk.decoder, lo=chunk.lo, hi=chunk.hi, compare=chunk.compare, negate=chunk.negate,
                 load_sel=chunk.load_sel, store_sel=chunk.store_sel, emit=chunk.emit,
                 lookup=chunk.lookup, lut_min=chunk.lut_min, shift=chunk.shift, base=chunk.base,
+                bloom=chunk.bloom, hash64=chunk.hash64,
             )
             stream_config.enqueue_stream_config(chunk.decoder, chunk.stream_type)
             self.set_stream_input(chunk.decoder, fpga_stream.Stream(chunk.stream_type, chunk.values))
@@ -96,13 +115,24 @@ class FilterStageTestCase(ConfiguredTestCase):
         assert word is not None, f"Lookup of the unwritten table word {index // 64}"
         return (word >> (index % 64)) & 1 == 1
 
+    def bloom_bit(self, chunk: Chunk, value: int) -> bool:
+        # The word of the low shift bits of the hash in the region, the four bits of the hash in it
+        width = 32 if chunk.stream_type == INT32 else 64
+        h = bloom_hash(value, width, chunk.hash64)
+        addr = (chunk.base + h % pow(2, chunk.shift)) % (self.table_bits // 64)
+        word = self.table_words.get(addr)
+        assert word is not None, f"Lookup of the unwritten table word {addr}"
+        mask = bloom_mask(h)
+        return word & mask == mask
+
     def expected_values(self, chunk: Chunk, bitmaps: dict[int, list[bool]]) -> list[int]:
         if chunk.compare:
             passes = [(chunk.lo <= value <= chunk.hi) != chunk.negate for value in chunk.values]
         else:
             passes = [True] * len(chunk.values)
         if chunk.lookup:
-            passes = [p and self.table_bit(chunk, value) for value, p in zip(chunk.values, passes)]
+            lookup = self.bloom_bit if chunk.bloom else self.table_bit
+            passes = [p and lookup(chunk, value) for value, p in zip(chunk.values, passes)]
         if chunk.load_sel:
             bitmap = bitmaps[chunk.decoder]
             passes = [p and bitmap[i] for i, p in enumerate(passes)]
@@ -394,3 +424,113 @@ class FilterStageTestCase(ConfiguredTestCase):
             lookup_chunk(0, INT32, a, 0, 2999, base=100),
             lookup_chunk(1, INT64, b, 0, 2999, base=100),
         ], {100: bitmap_words(bits)})
+
+    # -- Bloom filter -----------------------------------------------------------------------------
+    def bloom_values(self, rng: random.Random, keys: list[int], lo: int, hi: int, n: int) -> list[int]:
+        # Half of the values are keys, the rest random over [lo, hi]
+        return [rng.choice(keys) if rng.random() < 0.5 else rng.randint(lo, hi) for _ in range(n)]
+
+    def test_bloom_int32(self):
+        # The Bloom filter of a join on an INTEGER key, hashed as its zero extension, keys of both signs
+        rng = random.Random(30)
+        keys = [rng.randint(INT32_MIN, INT32_MAX) for _ in range(400)]
+        values = self.bloom_values(rng, keys, INT32_MIN, INT32_MAX, 2000)
+        self.run_chunks(
+            [bloom_chunk(0, INT32, values, 256, 0)],
+            {0: bloom_words(keys, 256, 32)},
+        )
+
+    def test_bloom_int64(self):
+        # A BIGINT key above 2^40 in a region whose base is no multiple of its size
+        rng = random.Random(31)
+        lo, hi = pow(2, 40), pow(2, 40) + pow(2, 36)
+        keys = [rng.randint(lo, hi) for _ in range(300)]
+        values = self.bloom_values(rng, keys, lo - 1000, hi + 1000, 1501)
+        self.run_chunks(
+            [bloom_chunk(0, INT64, values, 128, 300)],
+            {300: bloom_words(keys, 128, 64)},
+        )
+
+    def test_bloom_hash64(self):
+        # A BIGINT key in a chunk the decoder narrowed to INT32: the hash of the sign extension
+        rng = random.Random(32)
+        keys = [rng.randint(-pow(2, 30), pow(2, 30)) for _ in range(300)]
+        values = self.bloom_values(rng, keys, -pow(2, 30), pow(2, 30), 1800)
+        self.run_chunks(
+            [bloom_chunk(0, INT32, values, 128, 7, hash64=True)],
+            {7: bloom_words(keys, 128, 64)},
+        )
+
+    def test_bloom_fold(self):
+        # DuckDB's filter of 2048 words folded to the 64 words of its region; every key still passes
+        rng = random.Random(33)
+        keys = [rng.randint(0, pow(2, 40)) for _ in range(500)]
+        folded = fold_words(bloom_words(keys, 2048, 64), 64)
+        assert folded == bloom_words(keys, 64, 64)
+        values = self.bloom_values(rng, keys, 0, pow(2, 40), 1200)
+        self.run_chunks(
+            [bloom_chunk(0, INT64, values, 64, 40)],
+            {40: folded},
+        )
+
+    def test_bloom_with_compare(self):
+        # The min/max bounds of the join next to its Bloom filter
+        rng = random.Random(34)
+        keys = [rng.randint(10000, 2000000) for _ in range(200)]
+        values = self.bloom_values(rng, keys, 0, 3000000, 1700)
+        self.run_chunks(
+            [bloom_chunk(0, INT32, values, 64, 0, compare=True, lo=min(keys), hi=max(keys))],
+            {0: bloom_words(keys, 64, 32)},
+        )
+
+    def test_bloom_filter_only_then_apply(self):
+        # TPC-H Q18: the Bloom filter of l_orderkey selects the rows, the quantity loads the selection
+        rng = random.Random(35)
+        n = 1300
+        keys = [rng.randint(1, 6000000) * 4 for _ in range(100)]
+        orderkey = self.bloom_values(rng, keys, 1, 24000000, n)
+        quantity = [rng.randint(1, 50) for _ in range(n)]
+        self.run_chunks([
+            bloom_chunk(0, INT64, orderkey, 32, 0, store_sel=True, emit=False),
+            Chunk(0, INT64, quantity, load_sel=True),
+        ], {0: bloom_words(keys, 32, 64)})
+
+    def test_bloom_and_bitmap(self):
+        # A Bloom filter and a bitmap in one row group, then the conf changes between Bloom filter,
+        # bitmap, compare and none on short chunks of mixed width
+        rng = random.Random(36)
+        n = 1000
+        keys = [rng.randint(0, pow(2, 31) - 1) for _ in range(150)]
+        bits = [rng.random() < 0.5 for _ in range(64)]
+        table = {0: bitmap_words(bits), 8: bloom_words(keys, 16, 32), 24: bloom_words(keys, 16, 64)}
+        chunks = [
+            bloom_chunk(0, INT32, self.bloom_values(rng, keys, 0, pow(2, 31) - 1, n), 16, 8, store_sel=True,
+                        emit=False),
+            lookup_chunk(0, INT64, [rng.randint(0, 80) for _ in range(n)], 0, 63, load_sel=True, store_sel=True,
+                         emit=False),
+            Chunk(0, INT64, [rng.randint(0, 1000) for _ in range(n)], load_sel=True),
+        ]
+        for i in range(16):
+            m = rng.randint(1, 50)
+            typ = INT32 if i % 2 == 0 else INT64
+            if i % 4 == 0:
+                chunks.append(bloom_chunk(0, typ, self.bloom_values(rng, keys, 0, pow(2, 31) - 1, m), 16,
+                                          8 if typ == INT32 else 24))
+            elif i % 4 == 1:
+                chunks.append(lookup_chunk(0, typ, [rng.randint(0, 80) for _ in range(m)], 0, 63))
+            elif i % 4 == 2:
+                chunks.append(Chunk(0, typ, [rng.randint(0, 80) for _ in range(m)], compare=True, lo=10, hi=40))
+            else:
+                chunks.append(Chunk(0, typ, [rng.randint(0, 80) for _ in range(m)]))
+        self.run_chunks(chunks, table)
+
+    def test_bloom_two_decoders(self):
+        # Both decoders look up the same Bloom filter of the one table
+        rng = random.Random(37)
+        keys = [rng.randint(0, pow(2, 40)) for _ in range(250)]
+        a = self.bloom_values(rng, keys, 0, pow(2, 40), 900)
+        b = self.bloom_values(rng, keys, 0, pow(2, 40), 1100)
+        self.run_chunks([
+            bloom_chunk(0, INT64, a, 64, 100),
+            bloom_chunk(1, INT64, b, 64, 100),
+        ], {100: bloom_words(keys, 64, 64)})

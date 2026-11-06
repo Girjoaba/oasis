@@ -82,7 +82,10 @@ class LocalSourceOperator final : public SourceOperator {
  * bits), or if not with negate. Without compare every value passes. With a lookup region a value
  * also needs its bit (x - lut_min) >> shift of the region, the difference in the width of the
  * value; lo and hi have to keep the bits inside the region, and the lookup needs compare without
- * negate. load_sel ANDs the selection bitmap of the decoder (the pass bits of the previous filter
+ * negate. With bloom the region is a Bloom filter of 2^k words, as DuckDB builds it, in place of the
+ * bitmap: a value needs the four bits of its MurmurHash64 in the word of the k low bits of the hash
+ * (lut_min and shift unused, the compare optional); hash64 hashes an INT32 value as its 64 bit sign
+ * extension (a BIGINT key in a chunk narrowed to INT32). load_sel ANDs the selection bitmap of the decoder (the pass bits of the previous filter
  * columns of the row group) into the pass bits, store_sel writes the result back. Without emit the
  * output of the chunk is empty.
  *
@@ -100,6 +103,8 @@ struct FilterSpec {
     std::shared_ptr<FilterTableRegion> lookup;
     int64_t                            lut_min = 0;
     uint32_t                           shift   = 0;
+    bool                               bloom   = false;
+    bool                               hash64  = false;
 
     [[nodiscard]] bool is_passthrough() const {
         return !compare && !load_sel && !store_sel && emit;

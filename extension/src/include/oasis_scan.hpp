@@ -23,6 +23,9 @@ namespace duckdb {
 
 class PhysicalTableScan;
 
+// The last stage of the hardware filter (oasis_hw_filter_stage), its default.
+static constexpr uint64_t HW_FILTER_MAX_STAGE = 5;
+
 // Adds the lifetime of the scope to `target_ns`.
 class ScopedTimer {
 public:
@@ -50,7 +53,8 @@ struct HwInterval {
 // A yes/no bitmap the FilterStage looks the values of a column up in (hw_bitmap.hpp): a value x with
 // min <= x <= max passes if bit (x - min) >> shift of `words` is set. The bitmap of a filter that is
 // not optional passes the values of the filter and no other; else it may pass a superset, as a folded
-// prefix range bitmap of a join, whose rows the join checks again.
+// prefix range bitmap of a join, whose rows the join checks again. With bloom, `words` is a Bloom
+// filter of 2^k words in place of the bitmap (hw_bloom.hpp), optional only, and shift is unused.
 struct HwBitmap {
 	int64_t min;
 	int64_t max;
@@ -58,9 +62,18 @@ struct HwBitmap {
 	std::vector<uint64_t> words;
 	// Set bits before each word, for OnesFraction.
 	std::vector<uint32_t> ones_before;
+	bool bloom = false;
+	// The share of the values outside the keys that a Bloom filter passes.
+	double bloom_pass = 1;
+	// The number of keys of a Bloom filter, estimated from its set bits for the filter of a join.
+	double bloom_keys = 0;
 
 	// The share of set bits among the bits of the values lo to hi, which lie in [min, max].
 	double OnesFraction(int64_t lo, int64_t hi) const;
+
+	// The share of the values lo to hi that pass: OnesFraction, 1 without words, and for a Bloom filter
+	// its keys and bloom_pass of the other values, with the keys spread evenly over lo to hi.
+	double PassFraction(int64_t lo, int64_t hi) const;
 
 	// The region of the lookup table that holds the words, taken by the first row group that looks
 	// the bitmap up, so that a bitmap no group uses holds no room. Null when the table had no room
@@ -77,10 +90,11 @@ struct HwScanFilter {
 	// The interval the hardware compares for this filter, if it is a comparison of the column with a
 	// constant the FilterStage can take.
 	std::optional<HwInterval> interval;
-	// Whether interval comes from an optional join filter (min/max or prefix range of a hash join).
+	// Whether interval comes from an optional join filter (min/max, prefix range or Bloom filter of a
+	// hash join).
 	bool optional = false;
 	// The bitmap the hardware looks the values up in, with interval its [min, max]: a prefix range
-	// filter of a hash join or an IN list. Null for a comparison.
+	// filter of a hash join, an IN list or the Bloom filter of a hash join. Null for a comparison.
 	std::shared_ptr<const HwBitmap> bitmap;
 };
 
@@ -217,7 +231,7 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	// and without the FilterStage in the bitstream.
 	bool hw_filter = false;
 	// The stages the hardware filter takes (oasis_hw_filter_stage): 1 the constant comparisons, 2 the
-	// bounds of the joins, 3 the bitmaps, 4 the string columns as their dictionary ids.
+	// bounds of the joins, 3 the bitmaps, 4 the string columns as their dictionary ids, 5 the Bloom filters.
 	uint64_t hw_filter_stage = 0;
 
 	// Dynamic join filters (min/max pushed by hash joins into the probe-side scan). Our global

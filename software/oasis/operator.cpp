@@ -43,7 +43,10 @@ std::ostream &operator<<(std::ostream &os, const FilterSpec &spec) {
     } else {
         os << "all";
     }
-    if (spec.lookup) {
+    if (spec.lookup && spec.bloom) {
+        os << ", bloom " << spec.lookup->words().size() << " words" << (spec.hash64 ? " hash64" : "")
+           << " @" << spec.lookup->base();
+    } else if (spec.lookup) {
         os << ", bitmap " << spec.lut_min << " >> " << spec.shift << " @" << spec.lookup->base();
     }
     if (spec.load_sel) {
