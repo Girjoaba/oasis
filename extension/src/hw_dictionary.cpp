@@ -4,6 +4,7 @@
 #include "duckdb/logging/log_manager.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/table_filter_functions.hpp"
+#include "duckdb/storage/object_cache.hpp"
 #include "duckdb/storage/table/column_segment.hpp"
 #include "hw_bitmap.hpp"
 #include "parquet_reader.hpp"
@@ -103,15 +104,12 @@ void InitDictIdFilters(ClientContext &context, const OasisScanGlobalState &gstat
 	}
 }
 
-// The dictionary page of the chunk, read through the worker's file handle (staged or fetched over
-// RDMA on that path) and decoded into a reusable dictionary: PLAIN BYTE_ARRAY entries, raw or SNAPPY.
-static GroupDictionary ReadDictionary(FileHandle &handle, const DictionaryChunk &dict, const LogicalType &type,
-                                      const string &column_name) {
+// The dictionary page of the chunk (dict.dict_size bytes at `page`) decoded into a reusable dictionary: PLAIN
+// BYTE_ARRAY entries, raw or SNAPPY. `memory` is about the bytes the dictionary takes.
+static GroupDictionary DecodeDictionary(data_ptr_t page, const DictionaryChunk &dict, const LogicalType &type,
+                                        const string &column_name, idx_t &memory) {
 	auto &allocator = Allocator::DefaultAllocator();
-	auto page = allocator.Allocate(dict.dict_size);
-	handle.Read(page.get(), dict.dict_size, dict.dict_offset);
-
-	auto transport = duckdb_base_std::make_shared<TMemoryBuffer>(page.get(), uint32_t(dict.dict_size));
+	auto transport = duckdb_base_std::make_shared<TMemoryBuffer>(page, uint32_t(dict.dict_size));
 	TCompactProtocolFactoryT<TMemoryBuffer> factory;
 	auto protocol = factory.getProtocol(transport);
 	duckdb_parquet::PageHeader header;
@@ -133,7 +131,7 @@ static GroupDictionary ReadDictionary(FileHandle &handle, const DictionaryChunk 
 		                              (unsigned long long)MAX_DICTIONARY_IDS);
 	}
 
-	const_data_ptr_t body = page.get() + header_size;
+	const_data_ptr_t body = page + header_size;
 	idx_t body_size = idx_t(header.compressed_page_size);
 	AllocatedData uncompressed;
 	if (dict.ids.compression == parcore::metadata::Compression::SNAPPY) {
@@ -177,7 +175,149 @@ static GroupDictionary ReadDictionary(FileHandle &handle, const DictionaryChunk 
 		strings[e] = StringVector::AddStringOrBlob(data, str, length);
 		pos += length;
 	}
+	memory = sizeof(DictionaryEntry) + num_entries * sizeof(string_t) + body_size;
 	return result;
+}
+
+// A decoded dictionary in DuckDB's object cache, shared by the scans of every connection of the database:
+// the cache is thread-safe, and the scans only read the dictionary. The cache bounds its memory and drops
+// the least recently used entries first, also when the buffer pool needs the room.
+namespace {
+struct DictionaryCacheEntry : public ObjectCacheEntry {
+	DictionaryCacheEntry(GroupDictionary dictionary_p, idx_t memory_p)
+	    : dictionary(std::move(dictionary_p)), memory(memory_p) {
+	}
+
+	static string ObjectType() {
+		return "oasis_dictionary";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override {
+		return optional_idx(memory);
+	}
+
+	GroupDictionary dictionary;
+	idx_t memory;
+};
+} // namespace
+
+// The key of the dictionary page of the chunk: the file, its offset and its size.
+static string DictionaryCacheKey(const OasisScanLocalState &lstate, const DictionaryChunk &dict) {
+	return StringUtil::Format("%s:%llu:%llu", lstate.dict_cache_file, (unsigned long long)dict.dict_offset,
+	                          (unsigned long long)dict.dict_size);
+}
+
+// DecodeDictionary, and the dictionary into the cache.
+static GroupDictionary DecodeAndCacheDictionary(ClientContext &context, const OasisScanLocalState &lstate,
+                                                data_ptr_t page, const DictionaryChunk &dict, const LogicalType &type,
+                                                const string &column_name) {
+	idx_t memory = 0;
+	auto dictionary = DecodeDictionary(page, dict, type, column_name, memory);
+	if (!lstate.dict_cache_file.empty()) {
+		ObjectCache::GetObjectCache(context).PutWithTypePrefix<DictionaryCacheEntry>(
+		    DictionaryCacheKey(lstate, dict), make_shared_ptr<DictionaryCacheEntry>(dictionary, memory));
+	}
+	return dictionary;
+}
+
+// Whether a conjunct of dictionary id column i still filters the rows of the group, so that
+// PrepareDictIdColumns evaluates it over the dictionary before the group is submitted.
+static bool DictionaryNeededAtSubmit(const OasisScanLocalState &lstate,
+                                     const OasisScanLocalState::PendingGroup &pending, size_t i) {
+	for (size_t f = 0; f < lstate.scan_filters.size(); f++) {
+		const auto &scan_filter = lstate.scan_filters[f];
+		if (scan_filter.filter_idx == i && scan_filter.dict_id_filter && pending.needs_row_filter[f]) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool LookupDictionaries(ClientContext &context, const OasisScanGlobalState &gstate, OasisScanLocalState &lstate,
+                        const OasisScanBindData &bind, OasisScanLocalState::PendingGroup &pending, bool fetch) {
+	if (!gstate.has_dict_id_columns) {
+		return false;
+	}
+	ScopedTimer timer(lstate.string_decode_time_ns);
+	const size_t num_cols = gstate.projected_columns.size();
+	pending.dictionaries.assign(num_cols, {});
+	pending.dict_buffers.assign(num_cols, {});
+	pending.dict_slot.clear();
+	auto &cache = ObjectCache::GetObjectCache(context);
+	bool needed_at_submit = false;
+	for (size_t i = 0; i < num_cols; i++) {
+		const auto &col = gstate.projected_columns[i];
+		if (!col.dict_ids) {
+			continue;
+		}
+		const auto &name = bind.metadata.column_names[col.column_id];
+		const auto &dict = *bind.dict_chunks[pending.group][col.column_id];
+		if (!lstate.dict_cache_file.empty()) {
+			auto cached = cache.GetWithTypePrefix<DictionaryCacheEntry>(DictionaryCacheKey(lstate, dict));
+			if (cached) {
+				pending.dictionaries[i] = cached->dictionary;
+				lstate.dict_pages_cached++;
+				DUCKDB_LOG_DEBUG(context, "Row group %llu: the dictionary of column '%s' is in the cache",
+				                 (unsigned long long)pending.group, name.c_str());
+				continue;
+			}
+		}
+		lstate.dict_pages_fetched++;
+		if (fetch) {
+			pending.dict_slot.push_back(i);
+			needed_at_submit = needed_at_submit || DictionaryNeededAtSubmit(lstate, pending, i);
+			continue;
+		}
+		auto page = Allocator::DefaultAllocator().Allocate(dict.dict_size);
+		lstate.file_handle->Read(page.get(), dict.dict_size, dict.dict_offset);
+		pending.dictionaries[i] =
+		    DecodeAndCacheDictionary(context, lstate, page.get(), dict, bind.output_types[col.column_id], name);
+	}
+	return needed_at_submit;
+}
+
+void DecodeFetchedDictionaries(ClientContext &context, const OasisScanGlobalState &gstate, OasisScanLocalState &lstate,
+                               const OasisScanBindData &bind, OasisScanLocalState::PendingGroup &pending) {
+	if (pending.dict_slot.empty()) {
+		return;
+	}
+	ScopedTimer timer(lstate.string_decode_time_ns);
+	for (size_t i : pending.dict_slot) {
+		const auto &col = gstate.projected_columns[i];
+		const auto &dict = *bind.dict_chunks[pending.group][col.column_id];
+		auto &buffers = pending.dict_buffers[i];
+		// The bypass stream completes the buffers of a sink in order, so the batches hold the page in file
+		// order. A page in one buffer is decoded in place.
+		data_ptr_t page;
+		AllocatedData joined;
+		if (buffers.size() == 1 && buffers[0]->size == dict.dict_size) {
+			page = static_cast<data_ptr_t>(buffers[0]->ptr);
+		} else {
+			joined = Allocator::DefaultAllocator().Allocate(dict.dict_size);
+			idx_t copied = 0;
+			for (const auto &buf : buffers) {
+				if (copied + buf->size > dict.dict_size) {
+					throw IOException("Row group %llu: the dictionary page of column %llu overran its %llu bytes",
+					                  (unsigned long long)pending.group, (unsigned long long)i,
+					                  (unsigned long long)dict.dict_size);
+				}
+				memcpy(joined.get() + copied, buf->ptr, buf->size);
+				copied += buf->size;
+			}
+			if (copied != dict.dict_size) {
+				throw IOException("Row group %llu: the dictionary page of column %llu has %llu of its %llu bytes",
+				                  (unsigned long long)pending.group, (unsigned long long)i,
+				                  (unsigned long long)copied, (unsigned long long)dict.dict_size);
+			}
+			page = joined.get();
+		}
+		pending.dictionaries[i] = DecodeAndCacheDictionary(context, lstate, page, dict, bind.output_types[col.column_id],
+		                                                   bind.metadata.column_names[col.column_id]);
+		buffers.clear();
+	}
+	pending.dict_slot.clear();
 }
 
 // What the hardware takes of the passing ids: one interval of ids, the ids outside one interval
@@ -219,17 +359,19 @@ bool PrepareDictIdColumns(ClientContext &context, const OasisScanGlobalState &gs
 	}
 	ScopedTimer timer(lstate.string_decode_time_ns);
 	const size_t num_cols = gstate.projected_columns.size();
-	pending.dictionaries.assign(num_cols, {});
 	pending.dict_id_filters.assign(num_cols, nullptr);
 	for (size_t i = 0; i < num_cols; i++) {
 		const auto &col = gstate.projected_columns[i];
-		if (!col.dict_ids) {
+		// A column without a conjunct to evaluate gets its dictionary later, with the group's splinter
+		if (!col.dict_ids || !DictionaryNeededAtSubmit(lstate, pending, i)) {
 			continue;
 		}
 		const auto &name = bind.metadata.column_names[col.column_id];
-		const auto &dict = *bind.dict_chunks[pending.group][col.column_id];
-		pending.dictionaries[i] = ReadDictionary(*lstate.file_handle, dict, bind.output_types[col.column_id], name);
 		const auto &dictionary = pending.dictionaries[i];
+		if (!dictionary.entry) {
+			throw InternalException("Row group %llu: the dictionary of column '%s' is not in before the submit",
+			                        (unsigned long long)pending.group, name.c_str());
+		}
 
 		// The conjuncts narrow one selection of the entries, as on the rows
 		auto dict_id_filter = std::make_shared<DictIdFilter>();

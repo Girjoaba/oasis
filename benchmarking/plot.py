@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """Draws the charts of a run folder from the summary.json of analyze.py, as SVG files in <run>/plots/.
 
-    python3 plot.py <run folder>
+    python3 plot.py <run folder>  [--out DIR]   (summary.json of DIR, the plots in DIR/plots; DIR = the run)
 
 Every value is the median over the repetitions; the whisker spans their min and max. Charts:
   throughput_<dataset>.svg            Q/h per mode (bars at one thread count, lines over a thread sweep)
   ablation_<dataset>_t<T>.svg         Q/h per stage set of the hardware filter, native as a reference line
   latency_<dataset>_t<T>.svg          seconds per query and mode (shaded: oasis filtered rows in hardware)
   ablation_latency_<dataset>_t<T>.svg speedup over oasis_nohw per query and stage set, as a labelled heatmap
+The ablation charts of the narrow modes (oasis_s<k>_narrow) end in _narrow.svg.
 
 Style of the slides (tpch-results-slides): DejaVu Sans, ink #0B0B0B, muted #8D8C8A, grid #E6E6E5. Colour
 per mode, the same on every chart: oasis_nohw blue, oasis orange, native_rdma aqua, native_local yellow
-(the first four slots of the dataviz reference palette). The stage sets are one series in the colour of
-oasis. The heatmap is diverging: blue faster, red slower, gray within 5 % of oasis_nohw; every cell carries
-its value. Every mark has a <title>, the tooltip of a browser. Standard library only.
+(the first four slots of the dataviz reference palette). A narrow mode (oasis_narrow_transfer) keeps the
+colour of its mode with light 45 degree stripes (a dashed line over a thread sweep). The stage sets are one
+series in the colour of oasis. The heatmap is diverging: blue faster, red slower, gray within 5 % of
+oasis_nohw; every cell carries its value. Every mark has a <title>, the tooltip of a browser. Standard
+library only.
 """
 
 import argparse
@@ -23,7 +26,9 @@ from pathlib import Path
 
 COLOR = {"oasis_nohw": "#2A78D6", "oasis": "#EB6834", "native_rdma": "#1BAF7A", "native_local": "#EDA100"}
 LABEL = {"oasis_nohw": "oasis_nohw", "oasis": "oasis", "native_rdma": "native", "native_local": "native_local"}
-MODES = ["oasis_nohw", "oasis", "native_rdma", "native_local"]
+MODES = ["oasis_nohw", "oasis_nohw_narrow", "oasis", "oasis_narrow", "native_rdma", "native_local"]
+for _m in ["oasis_nohw", "oasis"]:
+    COLOR[_m + "_narrow"], LABEL[_m + "_narrow"] = COLOR[_m], LABEL[_m] + " narrow"
 LADDER = ["oasis_nohw", "oasis_s1", "oasis_s2", "oasis_s3", "oasis_s4", "oasis"]
 # The stage sets by what they add: constant comparisons, join bounds, bitmap lookup, dictionary ids, Bloom filters
 LADDER_NAME = {"oasis_nohw": "none", "oasis_s1": "constants", "oasis_s2": "+ join bounds", "oasis_s3": "+ bitmaps",
@@ -48,9 +53,19 @@ def fmt_tick(v: float) -> str:
 
 
 def svg_open(W, H, title):
+    # the stripes of the narrow modes: the colour of the mode, light stripes at 45 degrees
+    hatch = "".join(f'<pattern id="hatch-{m}" patternUnits="userSpaceOnUse" width="6" height="6" '
+                    f'patternTransform="rotate(45)"><rect width="6" height="6" fill="{COLOR[m]}"/>'
+                    f'<rect width="2" height="6" fill="{SURFACE}" fill-opacity="0.55"/></pattern>'
+                    for m in COLOR if m.endswith("_narrow"))
     return [f'<svg viewBox="0 0 {W} {H}" width="{W}" height="{H}" xmlns="http://www.w3.org/2000/svg" {FONT}>',
-            f'<rect width="{W}" height="{H}" fill="{SURFACE}"/>',
+            f'<defs>{hatch}</defs>', f'<rect width="{W}" height="{H}" fill="{SURFACE}"/>',
             f'<text x="10" y="18" font-size="13" font-weight="700" fill="{INK}">{title}</text>']
+
+
+def paint(m):
+    """The fill of a mode: its colour, striped for a narrow mode"""
+    return f"url(#hatch-{m})" if m.endswith("_narrow") else COLOR[m]
 
 
 def axes(o, L, TOP, pw, ph, ymax, step, ylabel):
@@ -93,7 +108,7 @@ def whisker(o, cx, y, s):
 
 def legend(o, x, y, modes):
     for m in modes:
-        o.append(f'<rect x="{x}" y="{y-9}" width="10" height="10" rx="2" fill="{COLOR[m]}"/>')
+        o.append(f'<rect x="{x}" y="{y-9}" width="10" height="10" rx="2" fill="{paint(m)}"/>')
         o.append(f'<text x="{x+14}" y="{y}" font-size="11.5" fill="{INK}">{LABEL[m]}</text>')
         x += 24 + 7 * len(LABEL[m])
 
@@ -105,7 +120,9 @@ def tip(name, s, unit, digits=0):
 
 def throughput_bars(ds, t, by_m):
     modes = [m for m in MODES if m in by_m]
-    W, H, L, R, TOP, B = 480, 340, 70, 16, 50, 34
+    # a label in two lines (the narrow modes) needs a deeper bottom margin
+    two = any(len(wrap(LABEL[m])) > 1 for m in modes)
+    W, H, L, R, TOP, B = max(480, 86 + 82 * len(modes)), 340 + (14 if two else 0), 70, 16, 50, 48 if two else 34
     pw, ph = W - L - R, H - TOP - B
     ymax, step = nice_axis(max(by_m[m]["qph"]["max"] for m in modes))
     o = svg_open(W, H, f"Throughput, {ds}, {t} threads")
@@ -115,11 +132,12 @@ def throughput_bars(ds, t, by_m):
     for i, m in enumerate(modes):
         s = by_m[m]["qph"]
         cx = L + (i + 0.5) * gw
-        bar(o, cx - bw / 2, bw, y, s["median"], COLOR[m], tip(LABEL[m], s, "Q/h"))
+        bar(o, cx - bw / 2, bw, y, s["median"], paint(m), tip(LABEL[m], s, "Q/h"))
         whisker(o, cx, y, s)
         o.append(f'<text x="{cx:.1f}" y="{y(s["max"]) - 6:.1f}" font-size="11.5" fill="{INK}" text-anchor="middle"'
                  + (' font-weight="700"' if m == "oasis" else "") + f'>{s["median"]:,.0f}</text>')
-        o.append(f'<text x="{cx:.1f}" y="{H-12}" font-size="11.5" fill="{INK}" text-anchor="middle">{LABEL[m]}</text>')
+        for k, line in enumerate(wrap(LABEL[m])):
+            o.append(f'<text x="{cx:.1f}" y="{H-B+22+14*k}" font-size="11.5" fill="{INK}" text-anchor="middle">{line}</text>')
     o.append("</svg>")
     return "\n".join(o)
 
@@ -127,7 +145,8 @@ def throughput_bars(ds, t, by_m):
 def throughput_lines(ds, by_t):
     threads = sorted(by_t)
     modes = [m for m in MODES if any(m in by_t[t] for t in threads)]
-    W, H, L, R, TOP, B = 640, 420, 70, 120, 40, 40
+    R = 150 if any(m.endswith("_narrow") for m in modes) else 120
+    W, H, L, TOP, B = 640 + R - 120, 420, 70, 40, 40
     pw, ph = W - L - R, H - TOP - B
     ymax, step = nice_axis(max(by_t[t][m]["qph"]["max"] for t in threads for m in modes if m in by_t[t]))
     o = svg_open(W, H, f"Throughput, {ds}")
@@ -142,7 +161,8 @@ def throughput_lines(ds, by_t):
     for m in sorted(modes, key=lambda m: m == "oasis"):
         pts = [(t, by_t[t][m]["qph"]) for t in threads if m in by_t[t]]
         line = " ".join("%.1f,%.1f" % (x(t), y(s["median"])) for t, s in pts)
-        o.append(f'<polyline points="{line}" fill="none" stroke="{COLOR[m]}" stroke-width="2" stroke-linejoin="round"/>')
+        dash = ' stroke-dasharray="6 4"' if m.endswith("_narrow") else ""
+        o.append(f'<polyline points="{line}" fill="none" stroke="{COLOR[m]}" stroke-width="2" stroke-linejoin="round"{dash}/>')
         for t, s in pts:
             whisker(o, x(t), y, s)
             o.append(f'<circle cx="{x(t):.1f}" cy="{y(s["median"]):.1f}" r="4" fill="{COLOR[m]}" stroke="{SURFACE}" '
@@ -153,7 +173,8 @@ def throughput_lines(ds, by_t):
     for ly, m in sorted(ends):
         ly = max(ly, placed[-1] + 15) if placed else ly
         placed.append(ly)
-        o.append(f'<line x1="{L+pw+6}" x2="{L+pw+18}" y1="{ly:.1f}" y2="{ly:.1f}" stroke="{COLOR[m]}" stroke-width="2"/>')
+        dash = ' stroke-dasharray="4 2"' if m.endswith("_narrow") else ""
+        o.append(f'<line x1="{L+pw+6}" x2="{L+pw+18}" y1="{ly:.1f}" y2="{ly:.1f}" stroke="{COLOR[m]}" stroke-width="2"{dash}/>')
         o.append(f'<text x="{L+pw+22}" y="{ly+4:.1f}" font-size="11.5" fill="{INK}"'
                  + (' font-weight="700"' if m == "oasis" else "") + f'>{LABEL[m]}</text>')
     legend(o, L, 34, modes)
@@ -161,21 +182,23 @@ def throughput_lines(ds, by_t):
     return "\n".join(o)
 
 
-def ablation_bars(ds, t, by_m):
-    ladder = [m for m in LADDER if m in by_m]
+def ablation_bars(ds, t, by_m, sfx=""):
+    """sfx "_narrow": the ladder of the narrow modes (oasis_nohw_narrow, oasis_s<k>_narrow, oasis_narrow)"""
     native = by_m.get("native_rdma", {}).get("qph", {}).get("median")
+    by_m = {m[:len(m) - len(sfx)]: r for m, r in by_m.items() if m.endswith(sfx)} if sfx else by_m
+    ladder = [m for m in LADDER if m in by_m]
     base = by_m.get("oasis_nohw", {}).get("qph", {}).get("median")
     W, H, L, R, TOP, B = 560, 370, 70, 70, 50, 60
     pw, ph = W - L - R, H - TOP - B
     ymax, step = nice_axis(max([by_m[m]["qph"]["max"] for m in ladder] + [native or 0]))
-    o = svg_open(W, H, f"Stages of the hardware filter, {ds}, {t} threads")
+    o = svg_open(W, H, f"Stages of the hardware filter, {ds}, {t} threads" + (", narrow transfer" if sfx else ""))
     y = axes(o, L, TOP, pw, ph, ymax, step, "queries per hour")
     gw = pw / len(ladder)
     bw = min(48.0, gw - 16)
     for i, m in enumerate(ladder):
         s = by_m[m]["qph"]
         cx = L + (i + 0.5) * gw
-        color = COLOR["oasis_nohw"] if m == "oasis_nohw" else COLOR["oasis"]
+        color = paint(("oasis_nohw" if m == "oasis_nohw" else "oasis") + sfx)
         bar(o, cx - bw / 2, bw, y, s["median"], color, tip(LADDER_NAME[m], s, "Q/h"))
         whisker(o, cx, y, s)
         label = f'{s["median"] / base:.2f}x' if base and m != "oasis_nohw" else f'{s["median"]:,.0f}'
@@ -215,7 +238,7 @@ def latency_bars(ds, t, by_m):
             if not s or s.get("median") is None:
                 continue
             x = x0 + j * (bw + 2)
-            bar(o, x, bw, y, s["median"], COLOR[m], tip(f"Q{q} {LABEL[m]}", s, "s", 3))
+            bar(o, x, bw, y, s["median"], paint(m), tip(f"Q{q} {LABEL[m]}", s, "s", 3))
             whisker(o, x + bw / 2, y, s)
         o.append(f'<text x="{cx:.1f}" y="{H-10}" font-size="11.5" fill="{INK}" text-anchor="middle"'
                  + (' font-weight="700"' if q in hw else "") + f'>Q{q}</text>')
@@ -224,7 +247,8 @@ def latency_bars(ds, t, by_m):
     return "\n".join(o)
 
 
-def ablation_heatmap(ds, t, by_m):
+def ablation_heatmap(ds, t, by_m, sfx=""):
+    by_m = {m[:len(m) - len(sfx)]: r for m, r in by_m.items() if m.endswith(sfx)} if sfx else by_m
     ladder = [m for m in LADDER if m in by_m and m != "oasis_nohw"]
     base = by_m["oasis_nohw"]
     queries = sorted({int(q) for q in base})
@@ -235,7 +259,7 @@ def ablation_heatmap(ds, t, by_m):
         lo = lim
     key_w = sum(24 + 6.5 * len(t.replace("&lt;", "<").replace("&gt;", ">")) for _, t in keys)
     W, H = max(L + cw * len(ladder) + 20, L + key_w + 10, 420), TOP + ch * len(queries) + 50
-    o = svg_open(W, H, f"Speedup over oasis_nohw, {ds}, {t} threads")
+    o = svg_open(W, H, f"Speedup over oasis_nohw, {ds}, {t} threads" + (", narrow transfer" if sfx else ""))
     o.append(f'<text x="{L}" y="36" font-size="11.5" fill="{SOFT}">stages on; median seconds of oasis_nohw / of the stages</text>')
     for j, m in enumerate(ladder):
         lines = wrap(LADDER_NAME[m])
@@ -271,10 +295,13 @@ def ablation_heatmap(ds, t, by_m):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("run", type=Path)
+    ap.add_argument("--out", type=Path, help="folder of summary.json and plots/ [the run folder]")
     a = ap.parse_args()
-    data = json.loads((a.run / "summary.json").read_text())
-    out = a.run / "plots"
-    out.mkdir(exist_ok=True)
+    src = a.out or a.run
+    data = json.loads((src / "summary.json").read_text())
+    out = src / "plots"
+    out.mkdir(parents=True, exist_ok=True)
+    stages = lambda by_m, sfx: any(f"oasis_s{k}{sfx}" in by_m for k in range(1, 6))
     charts = {}
     for ds, by_t in data.get("throughput", {}).items():
         main_t = {int(t): {m: r for m, r in by_m.items() if m in MODES and r.get("qph", {}).get("n")}
@@ -286,14 +313,16 @@ def main() -> int:
         elif main_t:
             charts[f"throughput_{ds}.svg"] = throughput_lines(ds, main_t)
         for t, by_m in by_t.items():
-            if any(m.startswith("oasis_s") for m in by_m):
-                charts[f"ablation_{ds}_t{t}.svg"] = ablation_bars(ds, t, by_m)
+            for sfx in ["", "_narrow"]:
+                if stages(by_m, sfx):
+                    charts[f"ablation_{ds}_t{t}{sfx}.svg"] = ablation_bars(ds, t, by_m, sfx)
     for ds, by_t in data.get("latency", {}).items():
         for t, by_m in by_t.items():
             if any(m in MODES for m in by_m):
                 charts[f"latency_{ds}_t{t}.svg"] = latency_bars(ds, t, {m: r for m, r in by_m.items() if m in MODES})
-            if "oasis_nohw" in by_m and any(m.startswith("oasis_s") for m in by_m):
-                charts[f"ablation_latency_{ds}_t{t}.svg"] = ablation_heatmap(ds, t, by_m)
+            for sfx in ["", "_narrow"]:
+                if "oasis_nohw" + sfx in by_m and stages(by_m, sfx):
+                    charts[f"ablation_latency_{ds}_t{t}{sfx}.svg"] = ablation_heatmap(ds, t, by_m, sfx)
     for name, svg in charts.items():
         (out / name).write_text(svg + "\n")
         print(f"{out / name}")

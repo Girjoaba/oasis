@@ -63,13 +63,19 @@ class FilterTable : public std::enable_shared_from_this<FilterTable> {
      */
     size_t largest_free_words() const;
 
+    /**
+     * The words of the regions not yet released, of every scan and session.
+     */
+    size_t words_in_use() const;
+
   private:
     friend class FilterTableRegion;
     void release(size_t base, size_t size);
 
     size_t                   words_;
     mutable std::mutex       mutex_;
-    std::map<size_t, size_t> free_; // base -> size, in words
+    std::map<size_t, size_t> free_;     // base -> size, in words
+    size_t                   used_ = 0; // words of the regions
 };
 
 } // namespace oasis

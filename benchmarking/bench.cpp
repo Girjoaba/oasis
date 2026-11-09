@@ -13,17 +13,24 @@
 //   oasis_nohw   read_oasis('rdma://<t>.parquet'), oasis_hw_filter = false (filters on the CPU)
 //   native_rdma  read_parquet('rdma://<t>.parquet'): DuckDB decodes, the bytes come over the bypass stream
 //   native_local read_parquet('<local-dir>/<t>.parquet')
+// An oasis mode takes the suffixes _narrow (oasis_narrow_transfer = true: BIGINT and DECIMAL chunks that fit
+// INT32 cross as INT32) and _pf<N> (oasis_prefetch_depth = N, over --prefetch), in this order:
+// oasis_nohw_narrow, oasis_s3_narrow_pf4. oasis_cast_pushdown stays off in every mode.
 //
 // Phases, in this order:
 //   warmup       SELECT * FROM <t> LIMIT 1 for every table: fills the Parquet metadata cache
 //   throughput   --tp-reps runs of --sessions streams, each the queries in a random order (seed + stream);
-//                without a latency pass, the rows of stream 0 of the first run go to results/
+//                without a latency pass, the rows of stream 0 of the first run go to results/. With
+//                --tp-profile every stream keeps the DuckDB JSON profile of each query as
+//                profile/tpR_sS_pPP_qNN.json (the scan metrics under concurrent streams)
 //   latency      --lat-reps passes over the queries on one connection, with the decoder counters and the
-//                DuckDB JSON profile of every query; the rows of the first pass go to results/
+//                DuckDB JSON profile of every query; the rows of the first pass go to results/. With
+//                --hw-log every query runs under DuckDB's log at DEBUG, and the messages of the hardware
+//                filter go to hwlog/qNN_rR.txt (the logging slows the query: a cell of its own)
 //
 // Output in --out: meta.json, settings.tsv, warmup.jsonl, throughput.jsonl, latency.jsonl,
-// results/qNN.tsv, profile/qNN_rR.json. Every line is flushed when written, so a killed run keeps
-// what it measured.
+// results/qNN.tsv, profile/qNN_rR.json, profile/tp*.json, hwlog/qNN_rR.txt. Every line is flushed when written, so a
+// killed run keeps what it measured.
 
 #include "duckdb.hpp"
 
@@ -52,6 +59,8 @@ namespace {
 
 struct Options {
     std::string mode = "oasis";
+    std::string base = "oasis";   // the mode without its suffixes
+    bool        narrow = false;
     int         stage = 5;
     std::string server;
     uint64_t    port = 0;
@@ -61,6 +70,8 @@ struct Options {
     int         tp_reps = 1;
     int         lat_reps = 0;
     bool        profile = true;
+    bool        hw_log = false;
+    bool        tp_profile = false;
     uint64_t    seed = 42;
     int         prefetch = 2;
     std::string memory_limit;
@@ -72,8 +83,9 @@ struct Options {
 void usage() {
     std::cerr << "usage: bench --mode oasis|oasis_s<k>|oasis_nohw|native_rdma|native_local --suite DIR --out DIR\n"
                  "                  [--server IP] [--port N] [--local-dir DIR] [--threads N] [--sessions N]\n"
-                 "                  [--tp-reps N] [--lat-reps N] [--no-profile] [--seed N] [--prefetch N]\n"
-                 "                  [--memory-limit SIZE] [--queries 1,6,14]\n";
+                 "                  [--tp-reps N] [--lat-reps N] [--no-profile] [--tp-profile] [--hw-log] [--seed N]\n"
+                 "                  [--prefetch N] [--memory-limit SIZE] [--queries 1,6,14]\n"
+                 "       an oasis mode takes the suffixes _narrow and _pf<N> (oasis_nohw_narrow, oasis_pf4)\n";
 }
 
 Options parse(int argc, char **argv) {
@@ -95,6 +107,8 @@ Options parse(int argc, char **argv) {
         else if (a == "--tp-reps") o.tp_reps = std::stoi(next());
         else if (a == "--lat-reps") o.lat_reps = std::stoi(next());
         else if (a == "--no-profile") o.profile = false;
+        else if (a == "--hw-log") o.hw_log = true;
+        else if (a == "--tp-profile") o.tp_profile = true;
         else if (a == "--seed") o.seed = std::stoull(next());
         else if (a == "--prefetch") o.prefetch = std::stoi(next());
         else if (a == "--memory-limit") o.memory_limit = next();
@@ -104,16 +118,31 @@ Options parse(int argc, char **argv) {
         else if (a == "-h" || a == "--help") { usage(); std::exit(0); }
         else throw std::runtime_error("unknown argument " + a);
     }
-    if (o.mode.size() == 8 && o.mode.compare(0, 7, "oasis_s") == 0 && o.mode[7] >= '0' && o.mode[7] <= '5') {
-        o.stage = o.mode[7] - '0';
-    } else if (o.mode != "oasis" && o.mode != "oasis_nohw" && o.mode != "native_rdma" &&
-               o.mode != "native_local") {
+    // Suffixes from the end: _pf<N>, then _narrow
+    o.base = o.mode;
+    auto pf = o.base.rfind("_pf");
+    if (pf != std::string::npos && pf + 3 < o.base.size() &&
+        o.base.find_first_not_of("0123456789", pf + 3) == std::string::npos) {
+        o.prefetch = std::stoi(o.base.substr(pf + 3));
+        o.base.resize(pf);
+    }
+    if (o.base.size() > 7 && o.base.compare(o.base.size() - 7, 7, "_narrow") == 0) {
+        o.narrow = true;
+        o.base.resize(o.base.size() - 7);
+    }
+    if (o.base.size() == 8 && o.base.compare(0, 7, "oasis_s") == 0 && o.base[7] >= '0' && o.base[7] <= '5') {
+        o.stage = o.base[7] - '0';
+    } else if (o.base != "oasis" && o.base != "oasis_nohw" && o.base != "native_rdma" &&
+               o.base != "native_local") {
         throw std::runtime_error("unknown mode " + o.mode);
     }
-    if (o.mode != "native_local" && o.server.empty()) {
+    if (o.base != o.mode && o.base.compare(0, 5, "oasis") != 0) {
+        throw std::runtime_error("the suffixes _narrow and _pf<N> need an oasis mode: " + o.mode);
+    }
+    if (o.base != "native_local" && o.server.empty()) {
         throw std::runtime_error("--server is required for mode " + o.mode);
     }
-    if (o.mode == "native_local" && o.local_dir.empty()) {
+    if (o.base == "native_local" && o.local_dir.empty()) {
         throw std::runtime_error("--local-dir is required for mode native_local");
     }
     if (o.suite.empty()) {
@@ -123,8 +152,19 @@ Options parse(int argc, char **argv) {
 }
 
 bool is_oasis(const Options &o) {
-    return o.mode.compare(0, 5, "oasis") == 0;
+    return o.base.compare(0, 5, "oasis") == 0;
 }
+
+bool hw_filter(const Options &o) {
+    return is_oasis(o) && o.base != "oasis_nohw";
+}
+
+// The messages of the hardware filter in DuckDB's log (DUCKDB_LOG_DEBUG of the extension, log type ''),
+// without the ones per batch, per read and per row group count
+const char *HW_LOG_QUERY =
+    "SELECT message FROM duckdb_logs WHERE coalesce(type, '') = '' AND message NOT LIKE 'Submitted QuerySplinter%' "
+    "AND message NOT LIKE 'Coalesced %' AND message NOT LIKE '%returned batch%' "
+    "AND message NOT LIKE '%rows pass the hardware filter' ORDER BY timestamp";
 
 std::string json_str(const std::string &s) {
     std::string r = "\"";
@@ -233,7 +273,7 @@ std::string source_of(const Options &o, const std::string &table) {
     if (is_oasis(o)) {
         return "read_oasis('rdma://" + table + ".parquet')";
     }
-    if (o.mode == "native_rdma") {
+    if (o.base == "native_rdma") {
         return "read_parquet('rdma://" + table + ".parquet')";
     }
     return "read_parquet('" + o.local_dir + "/" + table + ".parquet')";
@@ -277,6 +317,9 @@ int main(int argc, char **argv) {
     namespace fs = std::filesystem;
     fs::create_directories(o.out + "/results");
     fs::create_directories(o.out + "/profile");
+    if (o.hw_log) {
+        fs::create_directories(o.out + "/hwlog");
+    }
     auto t_start = Clock::now();
 
     try {
@@ -295,9 +338,13 @@ int main(int argc, char **argv) {
         must(ctl, "SET GLOBAL enable_external_file_cache = false");
         must(ctl, "SET GLOBAL oasis_prefetch_depth = " + std::to_string(o.prefetch));
         must(ctl, "SET GLOBAL oasis_enable_yield = true");
-        must(ctl, std::string("SET GLOBAL oasis_hw_filter = ") + (is_oasis(o) && o.mode != "oasis_nohw" ? "true" : "false"));
-        if (is_oasis(o) && o.mode != "oasis_nohw") {
+        must(ctl, std::string("SET GLOBAL oasis_hw_filter = ") + (hw_filter(o) ? "true" : "false"));
+        if (hw_filter(o)) {
             must(ctl, "SET GLOBAL oasis_hw_filter_stage = " + std::to_string(o.stage));
+        }
+        if (is_oasis(o)) {
+            must(ctl, std::string("SET GLOBAL oasis_narrow_transfer = ") + (o.narrow ? "true" : "false"));
+            must(ctl, "SET GLOBAL oasis_cast_pushdown = false");
         }
         if (!o.server.empty()) {
             must(ctl, "SET GLOBAL oasis_rdma_server = '" + o.server + "'");
@@ -355,7 +402,9 @@ int main(int argc, char **argv) {
             std::ofstream m(o.out + "/meta.json");
             m << "{" << json_str("mode") << ":" << json_str(o.mode) << "," << json_str("suite") << ":"
               << json_str(fs::path(o.suite).filename().string()) << "," << json_str("hw_filter_stage") << ":"
-              << (is_oasis(o) && o.mode != "oasis_nohw" ? o.stage : 0) << "," << json_str("server") << ":"
+              << (hw_filter(o) ? o.stage : 0) << "," << json_str("narrow") << ":" << (o.narrow ? "true" : "false")
+              << "," << json_str("hw_log") << ":" << (o.hw_log ? "true" : "false") << "," << json_str("tp_profile")
+              << ":" << (o.tp_profile ? "true" : "false") << "," << json_str("server") << ":"
               << json_str(o.server) << "," << json_str("port") << ":" << o.port << "," << json_str("local_dir") << ":"
               << json_str(o.local_dir) << "," << json_str("threads") << ":" << o.threads << ","
               << json_str("sessions") << ":" << o.sessions << "," << json_str("tp_reps") << ":" << o.tp_reps << ","
@@ -406,6 +455,15 @@ int main(int argc, char **argv) {
                     auto order = queries;
                     std::shuffle(order.begin(), order.end(), std::mt19937(o.seed + s));
                     std::string rec;
+                    std::string stream_profile;
+                    if (o.tp_profile) {
+                        stream_profile = o.out + "/profile/tp_s" + std::to_string(s) + ".json";
+                        auto a = con.Query("SET enable_profiling = 'json'");
+                        auto b = con.Query("SET profiling_output = '" + stream_profile + "'");
+                        if (a->HasError() || b->HasError()) {
+                            stream_profile.clear();
+                        }
+                    }
                     for (size_t pos = 0; pos < order.size(); pos++) {
                         double start = seconds_since(t0);
                         double end = -1;
@@ -413,6 +471,12 @@ int main(int argc, char **argv) {
                         try {
                             auto r = con.Query(order[pos].second);
                             end = seconds_since(t0);
+                            if (!stream_profile.empty()) {
+                                char pname[48];
+                                std::snprintf(pname, sizeof(pname), "tp%d_s%d_p%02zu_q%02d.json", rep, s, pos,
+                                              order[pos].first);
+                                std::ofstream(o.out + "/profile/" + pname) << read_file(stream_profile);
+                            }
                             if (r->HasError()) {
                                 error = r->GetError();
                             } else if (rep == 0 && s == 0 && o.lat_reps == 0) {
@@ -438,6 +502,9 @@ int main(int argc, char **argv) {
                                (ok ? "" : "," + json_str("error") + ":" + json_str(error)) + "}";
                     }
                     records[s] = rec;
+                    if (!stream_profile.empty()) {
+                        std::remove(stream_profile.c_str());
+                    }
                 });
             }
             for (auto &w : workers) {
@@ -484,7 +551,11 @@ int main(int argc, char **argv) {
             }
             for (int rep = 0; rep < o.lat_reps; rep++) {
                 for (auto &q : queries) {
-                    read_profile(ctl);
+                    if (o.hw_log) {
+                        must(ctl, "CALL truncate_duckdb_logs()");
+                        must(ctl, "CALL enable_logging(level = 'DEBUG', storage = 'memory')");
+                    }
+                    std::string prof_before = read_profile(ctl);
                     std::remove(last_profile.c_str());
                     auto cpu0 = cpu_now();
                     auto t0 = Clock::now();
@@ -498,6 +569,16 @@ int main(int argc, char **argv) {
                         std::ofstream(o.out + "/profile/" + name) << read_file(last_profile);
                     }
                     std::string prof = read_profile(ctl);
+                    if (o.hw_log) {
+                        must(ctl, "CALL disable_logging()");
+                        std::snprintf(name, sizeof(name), "q%02d_r%d.txt", q.first, rep);
+                        std::ofstream lf(o.out + "/hwlog/" + name);
+                        auto logs = must(ctl, HW_LOG_QUERY);
+                        for (auto &row : rows_of(*logs)) {
+                            lf << row[0].second << "\n";
+                        }
+                        must(ctl, "CALL truncate_duckdb_logs()");
+                    }
                     bool ok = !r->HasError();
                     size_t nrows = 0;
                     if (ok) {
@@ -512,7 +593,8 @@ int main(int argc, char **argv) {
                         << cpu1.user - cpu0.user << "," << json_str("cpu_sys_s") << ":" << cpu1.sys - cpu0.sys << ","
                         << json_str("rows") << ":" << nrows << "," << json_str("ok") << ":" << (ok ? "true" : "false")
                         << (ok ? "" : "," + json_str("error") + ":" + json_str(r->GetError())) << ","
-                        << json_str("profile") << ":" << prof << "}" << std::endl;
+                        << json_str("profile") << ":" << prof << "," << json_str("profile_before") << ":" << prof_before
+                        << "}" << std::endl;
                     std::printf("latency rep %d q%02d: %.3f s%s\n", rep, q.first, sec, ok ? "" : " ERROR");
                     std::fflush(stdout);
                 }

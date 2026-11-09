@@ -55,9 +55,11 @@ The checks of every scenario: 60 175 rows, and the revenue through Oasis equals 
 |---|---|---|
 | `tpch_q01` to `tpch_q22` | one TPC-H query of `tpch_queries()`, scale factor 0.01, over `rdma://` | `diff_rows` = 0, `hw_used`, `done` |
 | `edge` | the edge cases of `CASES` (types, limits, layouts, encodings, filters) | `diff_<case>` = 0 for every case, `hw_used`, `done` |
+| `edge_lossy` | the cases of `LOSSY_CASES` (`hwf_lx_*`) at stages 3 and 5, with the DEBUG log | `same_<case>_s<stage>`; the group is filtered in hardware (`hw_`); the CPU checks a join filter again after a folded bitmap, a Bloom filter or a bitmap without room in the table, and not after an exact bitmap (`recheck_`); a group that keeps more than DuckDB's threshold of a prefix range filter stays on the CPU (`gate_`) |
+| `edge_prof` | the cases of `PROF_CASES`, each between two reads of `oasis_stream_profile()` | `diff_<case>` = 0; the decoders write 4 bytes per value of an INTEGER column without a filter (`post_filter_bytes`), under a tenth of that with a filter that 1 % of the rows pass; the counters never go back |
 | `gap_<case>` | one input of `GAPS` that the decoder does not support yet (NULLs, BOOLEAN, V2 encodings, ZSTD, DECIMAL(38), empty file) | `zero_or_error`: correct or a clean error, never wrong rows; `done` |
 
-`hw_used` checks that the decoders saw input (`oasis_stream_profile()`), so a scan that ran only on the CPU fails. `done` is the last statement, so a crashed shell fails. Each gap is its own scenario, so a case that hangs or crashes the shell does not hide the others. When a gap is fixed, move its case from `GAPS` to `CASES`.
+`hw_used` checks that the decoders saw input (`oasis_stream_profile()`), so a scan that ran only on the CPU fails. `hw_bytes` checks that the decoders wrote to host memory (`post_filter_bytes`, counted by the scheduler from the completions). `done` is the last statement, so a crashed shell fails. Each gap is its own scenario, so a case that hangs or crashes the shell does not hide the others. When a gap is fixed, move its case from `GAPS` to `CASES`.
 
 All scenarios read over `rdma://`. The build enables RDMA, and `read_oasis` on a local file then stops the process.
 

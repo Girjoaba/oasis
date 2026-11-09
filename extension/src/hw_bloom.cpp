@@ -62,8 +62,9 @@ static std::vector<uint64_t> FoldBloom(const uint64_t *sectors, uint64_t num_sec
 // The Bloom filter of `words` (a power of two) over [min, max] with num_keys keys, the bitmap of a
 // Bloom filter lookup, or nullptr when it passes about every value: a Bloom filter that passes a
 // larger share of the values outside its keys than FOLDED_BITMAP_MAX_ONES is not worth the table,
-// its interval goes to the hardware alone. Without num_keys the set bits give the estimate.
-static std::shared_ptr<const HwBitmap> MakeBloom(int64_t min, int64_t max, std::vector<uint64_t> words,
+// its interval goes to the hardware alone. Without num_keys the set bits give the estimate. exact:
+// the words pass the values of the filter and no other (HwBitmap::exact).
+static std::shared_ptr<const HwBitmap> MakeBloom(int64_t min, int64_t max, std::vector<uint64_t> words, bool exact,
                                                  std::optional<uint64_t> num_keys = std::nullopt) {
 	D_ASSERT(IsPowerOfTwo(words.size()));
 	uint64_t ones = 0;
@@ -88,11 +89,12 @@ static std::shared_ptr<const HwBitmap> MakeBloom(int64_t min, int64_t max, std::
 	bitmap->bloom = true;
 	bitmap->bloom_pass = pass;
 	bitmap->bloom_keys = keys;
+	bitmap->exact = exact;
 	return bitmap;
 }
 
 std::shared_ptr<const HwBitmap> JoinBloom(ClientContext &context, const BloomFilter &filter,
-                                          const LogicalType &scan_type, uint64_t max_words) {
+                                          const LogicalType &key_type, uint64_t max_words) {
 	if (max_words == 0 || !filter.IsInitialized() || !filter.IsSealed()) {
 		return nullptr;
 	}
@@ -116,16 +118,18 @@ std::shared_ptr<const HwBitmap> JoinBloom(ClientContext &context, const BloomFil
 		}
 	}
 
-	const bool is_64 = scan_type.InternalType() == PhysicalType::INT64;
+	const bool is_64 = key_type.InternalType() == PhysicalType::INT64;
 	const int64_t min = is_64 ? NumericLimits<int64_t>::Minimum() : NumericLimits<int32_t>::Minimum();
 	const int64_t max = is_64 ? NumericLimits<int64_t>::Maximum() : NumericLimits<int32_t>::Maximum();
-	return MakeBloom(min, max, FoldBloom(bits, num_sectors, std::min<uint64_t>(num_sectors, max_words)));
+	// Exact if it fits unfolded: the hardware then looks up the words of DuckDB's filter
+	return MakeBloom(min, max, FoldBloom(bits, num_sectors, std::min<uint64_t>(num_sectors, max_words)),
+	                 num_sectors <= max_words);
 }
 
 std::shared_ptr<const HwBitmap> KeysBloom(int64_t min, int64_t max, const std::vector<uint64_t> &words,
                                           uint64_t num_keys) {
 	const uint64_t num_words = std::min<uint64_t>(BloomFilter::GetNumberOfSectors(num_keys), words.size());
-	return MakeBloom(min, max, FoldBloom(words.data(), words.size(), num_words), num_keys);
+	return MakeBloom(min, max, FoldBloom(words.data(), words.size(), num_words), false, num_keys);
 }
 
 } // namespace duckdb

@@ -2,6 +2,8 @@
 
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/types/hash.hpp"
+#include "duckdb/logging/log_manager.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
@@ -49,9 +51,45 @@ double HwBitmap::PassFraction(int64_t lo, int64_t hi) const {
 	return words.empty() ? 1 : OnesFraction(lo, hi);
 }
 
-std::shared_ptr<oasis::FilterTableRegion> HwBitmap::Region(oasis::FilterTable &table) const {
-	std::call_once(region_allocated, [&]() { region = table.allocate(words); });
+// Raises `peak` to `value` if it is lower.
+static void RaisePeak(std::atomic<uint64_t> &peak, uint64_t value) {
+	uint64_t seen = peak.load();
+	while (seen < value && !peak.compare_exchange_weak(seen, value)) {
+	}
+}
+
+std::shared_ptr<oasis::FilterTableRegion> HwBitmap::Region(ClientContext &context, oasis::FilterTable &table,
+                                                           HwTableCounters &counters) const {
+	std::lock_guard<std::mutex> guard(region_lock);
+	if (region_requested) {
+		return region;
+	}
+	region_requested = true;
+	region = table.allocate(words);
+	const uint64_t in_use = table.words_in_use();
+	counters.requests++;
+	RaisePeak(counters.peak_words_in_use, in_use);
+	if (region) {
+		counters.words += words.size();
+		DUCKDB_LOG_DEBUG(context, "Lookup table: region of %llu words at word %llu, %llu of %llu words in use",
+		                 (unsigned long long)words.size(), (unsigned long long)region->base(),
+		                 (unsigned long long)in_use, (unsigned long long)table.words());
+	} else {
+		counters.failures++;
+		DUCKDB_LOG_DEBUG(context,
+		                 "Lookup table: no room for %llu words, the largest free range has %llu, %llu of %llu "
+		                 "words in use",
+		                 (unsigned long long)words.size(), (unsigned long long)table.largest_free_words(),
+		                 (unsigned long long)in_use, (unsigned long long)table.words());
+	}
 	return region;
+}
+
+size_t HwBitmap::ReleaseRegion() const {
+	std::lock_guard<std::mutex> guard(region_lock);
+	const size_t released = region ? region->words().size() : 0;
+	region.reset();
+	return released;
 }
 
 // The largest bitmap a new region can hold now, in bits.
@@ -97,8 +135,11 @@ std::shared_ptr<const HwBitmap> MakeBitmap(int64_t min, int64_t max, uint32_t sh
 
 	// Every bit set is the interval, also for an exact bitmap
 	if (ones == num_bits || (!exact && double(ones) > FOLDED_BITMAP_MAX_ONES * double(num_bits))) {
+		bitmap->exact = shift == 0 && ones == num_bits;
 		return bitmap;
 	}
+	// A bitmap of shift 0 holds every value of the filter; without words it is the interval alone
+	bitmap->exact = shift == 0 && !words.empty();
 	bitmap->words = std::move(words);
 	return bitmap;
 }
@@ -236,35 +277,52 @@ static std::shared_ptr<const HwBitmap> InListBitmap(const BoundOperatorExpressio
 	return MakeBitmap(min, max, shift, exact, std::move(words));
 }
 
+bool ReadsInt32Key(const Expression &expr, const LogicalType &scan_type) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION || scan_type.id() != LogicalTypeId::BIGINT) {
+		return false;
+	}
+	auto &func = expr.Cast<BoundFunctionExpression>();
+	if (func.GetChildren().empty() || !BoundCastExpression::IsCast(*func.GetChildren()[0])) {
+		return false;
+	}
+	auto &cast = func.GetChildren()[0]->Cast<BoundFunctionExpression>();
+	const auto &child = BoundCastExpression::Child(cast);
+	return cast.GetReturnType().id() == LogicalTypeId::INTEGER && ExpressionFilter::IsSimpleFilterColumnRef(child) &&
+	       child.GetReturnType() == scan_type;
+}
+
 std::shared_ptr<const HwBitmap> LookupBitmap(ClientContext &context, oasis::FilterTable &table, const Expression &expr,
                                              const LogicalType &scan_type, bool optional, bool bloom) {
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
 		auto &func = expr.Cast<BoundFunctionExpression>();
 		const auto &name = func.Function().GetName();
-		if (!func.BindInfo() || !ExpressionFilter::IsSimpleFilterColumnRef(*func.GetChildren()[0])) {
+		// The column, or the column cast to the INTEGER key of a compressed join (ReadsInt32Key)
+		const bool int32_key = ReadsInt32Key(expr, scan_type);
+		if (!func.BindInfo() || (!ExpressionFilter::IsSimpleFilterColumnRef(*func.GetChildren()[0]) && !int32_key)) {
 			return nullptr;
 		}
 		const auto physical = scan_type.InternalType();
 		if (physical != PhysicalType::INT32 && physical != PhysicalType::INT64) {
 			return nullptr;
 		}
+		const LogicalType key_type = int32_key ? LogicalType(LogicalType::INTEGER) : scan_type;
 		const uint64_t bloom_words = bloom ? BloomWords(table) : 0;
 		if (name == PrefixRangeScalarFun::NAME) {
 			auto &data = func.BindInfo()->Cast<PrefixRangeFunctionData>();
-			if (!data.filter || data.key_type != scan_type) {
+			if (!data.filter || data.key_type != key_type) {
 				return nullptr;
 			}
-			if (physical == PhysicalType::INT32) {
-				return PrefixRangeBitmap<int32_t>(*data.filter, scan_type, table, bloom_words);
+			if (key_type.InternalType() == PhysicalType::INT32) {
+				return PrefixRangeBitmap<int32_t>(*data.filter, key_type, table, bloom_words);
 			}
-			return PrefixRangeBitmap<int64_t>(*data.filter, scan_type, table, bloom_words);
+			return PrefixRangeBitmap<int64_t>(*data.filter, key_type, table, bloom_words);
 		}
 		if (name == BloomFilterScalarFun::NAME && bloom) {
 			auto &data = func.BindInfo()->Cast<BloomFilterFunctionData>();
-			if (!data.filter || data.key_type != scan_type) {
+			if (!data.filter || data.key_type != key_type) {
 				return nullptr;
 			}
-			return JoinBloom(context, *data.filter, scan_type, bloom_words);
+			return JoinBloom(context, *data.filter, key_type, bloom_words);
 		}
 		return nullptr;
 	}

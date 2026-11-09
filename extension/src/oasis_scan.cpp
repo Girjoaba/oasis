@@ -226,6 +226,14 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	const bool hw_filter_setting = (hw_filter_val.IsNull() || hw_filter_val.GetValue<bool>()) && stage > 0;
 	gstate->hw_filter_stage = hw_filter_setting ? stage : 0;
 
+	Value early_release_val;
+	context.TryGetCurrentSetting("oasis_filter_table_early_release", early_release_val);
+	gstate->table_early_release = !early_release_val.IsNull() && early_release_val.GetValue<bool>();
+
+	Value dict_cache_val;
+	context.TryGetCurrentSetting("oasis_dict_cache", dict_cache_val);
+	gstate->dict_cache = dict_cache_val.IsNull() || dict_cache_val.GetValue<bool>();
+
 	// Dictionary ids (stage 4): a string column whose chunks are all dictionary-encoded goes to the decoders as its dictionary ids
 	const bool emit_ids_supported = gstate->hw_filter_stage >= 4 &&
 	                                ctx.has_config<parcore::ColumnChunkDecoderConfig>() &&
@@ -354,6 +362,20 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
 	auto &fs = FileSystem::GetFileSystem(context.client);
 	lstate->file_handle = fs.OpenFile(gstate.filename, FileOpenFlags::FILE_FLAGS_READ);
 
+	// The file in the keys of the cached dictionaries (oasis_dict_cache): a file rewritten in place has
+	// another size or modification time, and so other keys. A file system without modification times
+	// caches no dictionary.
+	if (gstate.has_dict_id_columns && gstate.dict_cache) {
+		try {
+			const auto file_size = lstate->file_handle->GetFileSize();
+			const auto last_modified = fs.GetLastModifiedTime(*lstate->file_handle);
+			lstate->dict_cache_file = StringUtil::Format("%s:%llu:%lld", gstate.filename, (unsigned long long)file_size,
+			                                             (long long)last_modified.value);
+		} catch (NotImplementedException &) {
+			lstate->dict_cache_file.clear();
+		}
+	}
+
 	// Build a per-worker ParquetReader: its per-column readers supply the per-column-chunk statistics
 	// used for row-group skipping (RowGroupMatchesFilters). The CPU decode path additionally drives
 	// these readers in OasisScanFunction. We project every file column (one FULL_READ ColumnIndex per
@@ -430,22 +452,50 @@ static uint64_t RowGroupNumRows(const OasisScanBindData &bind, size_t group) {
 	return chunks.empty() ? 0 : chunks[0].num_values;
 }
 
+// The raw fetch of the dictionary pages of pending.dict_slot (RDMA only), as the CPU columns: one bypass
+// flow per page into `splinter`, tagged with the number of projected columns plus the projection index.
+// Returns the number of batches they surface as.
+static size_t AddDictionaryFlows(oasis::OasisContext &ctx, const OasisScanGlobalState &gstate, RDMAFileHandle &rdma,
+                                 const OasisScanBindData &bind, const OasisScanLocalState::PendingGroup &pending,
+                                 oasis::QuerySplinter &splinter) {
+	size_t batches = 0;
+	for (size_t i : pending.dict_slot) {
+		const auto &dict = *bind.dict_chunks[pending.group][gstate.projected_columns[i].column_id];
+
+		oasis::OperatorFlow flow;
+		flow.push_back(std::make_unique<oasis::RDMASourceOperator>(rdma.remote_offset + dict.dict_offset, dict.dict_size));
+		std::vector<std::shared_ptr<libstf::Buffer>> sink_buffers;
+		size_t remaining = dict.dict_size;
+		while (remaining > 0) {
+			size_t chunk = std::min<size_t>(remaining, libstf::MAXIMUM_OUTPUT_WRITER_BUFFER_SIZE);
+			sink_buffers.push_back(ctx.allocate_output_buffer(chunk));
+			remaining -= chunk;
+			batches++;
+		}
+		flow.push_back(
+		    std::make_unique<oasis::LocalSinkOperator>(std::move(sink_buffers), gstate.projected_columns.size() + i));
+		splinter.streams.push_back(std::move(flow));
+	}
+	return batches;
+}
+
 // Submits the whole row group as one QuerySplinter: one decode flow per hardware column and, on
-// the RDMA path, one raw bypass flow per CPU column fetching its compressed bytes. Each flow's
-// sink is tagged with the projection index. The consumer places the tagged batches into
-// hw_buffers[projection_index] / cpu_buffers[projection_index]. For RDMA, the hardware pulls bytes
-// straight into the streams. On the local path the hardware-column bytes are read coalesced, 
-// synchronously on the worker, before submission.
-static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
-                          OasisScanLocalState &lstate, const OasisScanBindData &bind,
-                          OasisScanLocalState::PendingGroup &pending) {
+// the RDMA path, one raw bypass flow per CPU column fetching its compressed bytes and per dictionary
+// page still to fetch. Each flow's sink is tagged with the projection index (a dictionary page with
+// the number of projected columns plus it). The consumer places the tagged batches into
+// hw_buffers[projection_index] / cpu_buffers[projection_index] / dict_buffers[projection_index]. For
+// RDMA, the hardware pulls bytes straight into the streams. On the local path the hardware-column
+// bytes are read coalesced, synchronously on the worker, before submission.
+static void SubmitGroup(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
+                        OasisScanLocalState &lstate, const OasisScanBindData &bind,
+                        OasisScanLocalState::PendingGroup &pending) {
 	const size_t group = pending.group;
 	auto *rdma = dynamic_cast<RDMAFileHandle *>(lstate.file_handle.get());
 	pending.hw_buffers.assign(gstate.projected_columns.size(), nullptr);
 	pending.cpu_buffers.assign(gstate.projected_columns.size(), {});
 	pending.hw_emit.assign(gstate.projected_columns.size(), true);
 
-	// The dictionaries of the dictionary id columns, and the conjuncts on them evaluated over the entries
+	// The conjuncts on the dictionary id columns evaluated over the entries of their dictionaries
 	if (!PrepareDictIdColumns(context, gstate, lstate, bind, pending)) {
 		pending.num_rows = 0;
 		return;
@@ -575,6 +625,14 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 		splinter.streams.push_back(std::move(flow));
 	}
 
+	// The dictionary pages no conjunct needs before the submit come with the columns and are decoded
+	// when the group is collected (GetNextGroup).
+	if (!pending.dict_slot.empty()) {
+		pending.batches_remaining += AddDictionaryFlows(ctx, gstate, *rdma, bind, pending, splinter);
+		DUCKDB_LOG_DEBUG(context, "Row group %llu: %llu dictionary page(s) fetched with the row group.",
+		                 (unsigned long long)group, (unsigned long long)pending.dict_slot.size());
+	}
+
 	// A group with nothing to fetch or decode in hardware (e.g. a string-only projection on the
 	// local path) submits no splinter and leaves `result` default-constructed.
 	if (pending.batches_remaining == 0) {
@@ -586,6 +644,27 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	DUCKDB_LOG_DEBUG(context, "Submitted QuerySplinter (%llu flow(s)) for row group %llu.",
 	                 (unsigned long long)(pending.hw_slot.size() + pending.cpu_slot.size()),
 	                 (unsigned long long)group);
+}
+
+// Starts a row group: its dictionaries (LookupDictionaries), then SubmitGroup. No dictionary page is read
+// on the worker on the RDMA path: the group's splinter fetches the pages with the columns. When the
+// conjuncts of a column need its dictionary for the FilterSpec, the pages come first, in a splinter of
+// their own, and the group is submitted once they are in (TrySubmitWaitingGroup), while the worker
+// emits the groups before it.
+static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
+                          OasisScanLocalState &lstate, const OasisScanBindData &bind,
+                          OasisScanLocalState::PendingGroup &pending) {
+	auto *rdma = dynamic_cast<RDMAFileHandle *>(lstate.file_handle.get());
+	if (LookupDictionaries(context, gstate, lstate, bind, pending, rdma != nullptr)) {
+		oasis::QuerySplinter splinter;
+		pending.dict_batches_remaining = AddDictionaryFlows(ctx, gstate, *rdma, bind, pending, splinter);
+		pending.dict_result = ctx.scheduler().submit(std::move(splinter));
+		pending.awaiting_dictionaries = true;
+		DUCKDB_LOG_DEBUG(context, "Row group %llu: %llu dictionary page(s) fetched before the row group is submitted.",
+		                 (unsigned long long)pending.group, (unsigned long long)pending.dict_slot.size());
+		return;
+	}
+	SubmitGroup(context, ctx, gstate, lstate, bind, pending);
 }
 
 // Positions the shared CPU readers at the start of `group`'s CPU/string columns (page-header
@@ -648,6 +727,12 @@ static bool TryCollectGroup(ClientContext &context, OasisScanGlobalState &gstate
 			                        (unsigned long long)pending.batches_remaining);
 		}
 		size_t const tag = poll.batch->tag;
+		// A dictionary page (AddDictionaryFlows), decoded once the group is collected
+		if (tag >= gstate.projected_columns.size()) {
+			pending.dict_buffers[tag - gstate.projected_columns.size()].push_back(std::move(poll.batch->buffer));
+			pending.batches_remaining--;
+			continue;
+		}
 		size_t const col_id = gstate.projected_columns[tag].column_id;
 		DUCKDB_LOG_DEBUG(context, "Row group %llu, column %llu ('%s') returned batch",
 		                 (unsigned long long)pending.group, (unsigned long long)col_id,
@@ -660,6 +745,51 @@ static bool TryCollectGroup(ClientContext &context, OasisScanGlobalState &gstate
 		pending.batches_remaining--;
 	}
 	return true;
+}
+
+// Non-blocking: Drains the splinter of the dictionary pages a row group waits for (pending.dict_result)
+// into pending.dict_buffers. Returns true once every page is in.
+static bool TryCollectDictionaries(const OasisScanGlobalState &gstate, OasisScanLocalState::PendingGroup &pending) {
+	while (pending.dict_batches_remaining > 0) {
+		auto poll = pending.dict_result.try_get_next_batch();
+		if (!poll.ready) {
+			return false;
+		}
+		if (!poll.batch) {
+			throw InternalException("Row group %llu: its dictionary pages closed with %llu batch(es) missing",
+			                        (unsigned long long)pending.group,
+			                        (unsigned long long)pending.dict_batches_remaining);
+		}
+		pending.dict_buffers[poll.batch->tag - gstate.projected_columns.size()].push_back(
+		    std::move(poll.batch->buffer));
+		pending.dict_batches_remaining--;
+	}
+	return true;
+}
+
+// Submits a row group that waits for its dictionary pages once they are in: decodes them, then
+// SubmitGroup. Returns false while they are on their way.
+static bool TrySubmitWaitingGroup(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
+                                  OasisScanLocalState &lstate, const OasisScanBindData &bind,
+                                  OasisScanLocalState::PendingGroup &pending) {
+	if (!TryCollectDictionaries(gstate, pending)) {
+		return false;
+	}
+	pending.awaiting_dictionaries = false;
+	DecodeFetchedDictionaries(context, gstate, lstate, bind, pending);
+	SubmitGroup(context, ctx, gstate, lstate, bind, pending);
+	return true;
+}
+
+// Submits the row groups in flight whose dictionary pages came in, so that they decode while the worker
+// emits the group before them.
+static void SubmitWaitingGroups(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
+                                OasisScanLocalState &lstate, const OasisScanBindData &bind) {
+	for (auto &pending : lstate.inflight) {
+		if (pending->awaiting_dictionaries) {
+			TrySubmitWaitingGroup(context, ctx, gstate, lstate, bind, *pending);
+		}
+	}
 }
 
 // Claims the next non-empty row group off the shared atomic cursor, returning its index (or
@@ -693,16 +823,55 @@ static size_t ClaimNextMatchingGroup(ClientContext &context, OasisScanGlobalStat
 
 enum class LoadResult : uint8_t { LOADED, BLOCKED, EXHAUSTED };
 
+// Closes a row group of TopUpPrefetch: collected, or a claim that found none. Once the last one closes
+// after the cursor ran out, no group of the scan looks a region of the lookup table up any more: the
+// counters of the table go to the debug log and, with oasis_filter_table_early_release, the regions of
+// the bitmaps of the scan return to the table now, not when DuckDB frees the global state at the end of
+// the query. A flow still in flight keeps its region through its FilterSpec. A worker that stops with
+// groups in flight (a LIMIT) leaves the regions to the end of the query.
+static void CloseGroup(ClientContext &context, OasisScanGlobalState &gstate) {
+	if (gstate.groups_open.fetch_sub(1) != 1 || gstate.next_group.load() < gstate.total_groups) {
+		return;
+	}
+	std::call_once(gstate.scan_done, [&]() {
+		const auto &counters = gstate.table_counters;
+		if (counters.requests > 0) {
+			DUCKDB_LOG_DEBUG(context,
+			                 "Lookup table of the scan: %llu requests, %llu without room, %llu row groups with the "
+			                 "interval alone, %llu on the CPU filter, %llu words, peak %llu words in use",
+			                 (unsigned long long)counters.requests.load(), (unsigned long long)counters.failures.load(),
+			                 (unsigned long long)counters.interval_fallbacks.load(),
+			                 (unsigned long long)counters.cpu_fallbacks.load(), (unsigned long long)counters.words.load(),
+			                 (unsigned long long)counters.peak_words_in_use.load());
+		}
+		if (!gstate.table_early_release) {
+			return;
+		}
+		size_t released = 0;
+		for (const auto &hw : gstate.hw_filters) {
+			if (hw.bitmap) {
+				released += hw.bitmap->ReleaseRegion();
+			}
+		}
+		if (released > 0) {
+			DUCKDB_LOG_DEBUG(context, "Lookup table: released %llu words of the scan", (unsigned long long)released);
+		}
+	});
+}
+
 // Keeps the pipeline full: Claims matching groups up to the per-worker budget and runs
 // PrefetchGroup on each (synchronous coalesced reads + splinter submission), so later groups decode
 // in hardware while we collect the head.
 static void TopUpPrefetch(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
                           OasisScanLocalState &lstate, const OasisScanBindData &bind) {
+	SubmitWaitingGroups(context, ctx, gstate, lstate, bind);
 	while (!lstate.groups_exhausted && lstate.inflight.size() < gstate.groups_in_flight_per_worker) {
 		std::vector<bool> needs_row_filter;
+		gstate.groups_open++;
 		size_t group = ClaimNextMatchingGroup(context, gstate, lstate, bind, needs_row_filter);
 		if (group >= gstate.total_groups) {
 			lstate.groups_exhausted = true;
+			CloseGroup(context, gstate);
 			break;
 		}
 		auto pending = make_uniq<OasisScanLocalState::PendingGroup>();
@@ -752,6 +921,18 @@ static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx,
 
 	auto &head = *lstate.inflight.front();
 
+	// A group that waits for its dictionary pages is submitted once they are in.
+	if (head.awaiting_dictionaries) {
+		if (gstate.synchronous) {
+			while (!TrySubmitWaitingGroup(context, ctx, gstate, lstate, bind, head)) {
+				head.dict_result.wait_ready();
+			}
+		} else if (!TrySubmitWaitingGroup(context, ctx, gstate, lstate, bind, head)) {
+			out_tasks.push_back(make_uniq<OasisSplinterResultTask>(head.dict_result));
+			return LoadResult::BLOCKED;
+		}
+	}
+
 	// A group with nothing to fetch or decode in hardware (string-only projection on the local
 	// path) submitted no splinter, so skip straight to loading the string columns.
 	if (head.submitted) {
@@ -772,6 +953,12 @@ static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx,
 		}
 	}
 
+	for (const auto &buffer : head.hw_buffers) {
+		if (buffer) {
+			lstate.hw_bytes_out += buffer->size;
+		}
+	}
+
 	// A hardware-filtered group has the rows the hardware kept. A group without any loads with 0
 	// rows, and EmitOneSlice goes on to the next one.
 	size_t num_rows = head.num_rows;
@@ -780,6 +967,11 @@ static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx,
 		lstate.hw_filter_rows_out += num_rows;
 		DUCKDB_LOG_DEBUG(context, "Row group %llu: %llu of %llu rows pass the hardware filter",
 		                 (unsigned long long)head.group, (unsigned long long)num_rows, (unsigned long long)head.num_rows);
+	}
+
+	// The dictionary pages that came with the columns, for a group with rows to emit
+	if (num_rows > 0) {
+		DecodeFetchedDictionaries(context, gstate, lstate, bind, head);
 	}
 
 	lstate.current_buffers = std::move(head.hw_buffers);
@@ -818,6 +1010,7 @@ static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx,
 
 	InitGroupCPUColumns(context, gstate, lstate, head.group);
 	lstate.inflight.pop_front();
+	CloseGroup(context, gstate);
 	return LoadResult::LOADED;
 }
 
@@ -839,6 +1032,11 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 		if (load != LoadResult::LOADED) {
 			return {0, load}; // BLOCKED or EXHAUSTED.
 		}
+	}
+
+	// The later groups whose dictionary pages came in go to the decoders now, not after this group.
+	if (gstate.has_dict_id_columns) {
+		SubmitWaitingGroups(context, ctx, gstate, lstate, bind);
 	}
 
 	size_t const total_elements = lstate.current_group_num_rows;
@@ -1053,11 +1251,17 @@ void OasisScanGetMetrics(TableFunctionGetMetricsInput &input) {
 		gstate.hw_filter_groups += lstate.hw_filter_groups;
 		gstate.hw_filter_rows_in += lstate.hw_filter_rows_in;
 		gstate.hw_filter_rows_out += lstate.hw_filter_rows_out;
+		gstate.hw_bytes_out += lstate.hw_bytes_out;
+		gstate.dict_pages_fetched += lstate.dict_pages_fetched;
+		gstate.dict_pages_cached += lstate.dict_pages_cached;
 		lstate.filter_time_ns = 0;
 		lstate.string_decode_time_ns = 0;
 		lstate.hw_filter_groups = 0;
 		lstate.hw_filter_rows_in = 0;
 		lstate.hw_filter_rows_out = 0;
+		lstate.hw_bytes_out = 0;
+		lstate.dict_pages_fetched = 0;
+		lstate.dict_pages_cached = 0;
 	}
 
 	// Sums over all workers, so they can exceed the operator's wall-clock time.
@@ -1072,12 +1276,31 @@ void OasisScanGetMetrics(TableFunctionGetMetricsInput &input) {
 		const auto dict_id_columns = std::count_if(gstate.projected_columns.begin(), gstate.projected_columns.end(),
 		                                           [](const ProjectedColumn &col) { return col.dict_ids; });
 		input.operator_metrics.AddExtraInfo("HW Dictionary Id Columns", std::to_string(dict_id_columns));
+		// The dictionary pages read or fetched, and those taken from the cache (oasis_dict_cache)
+		input.operator_metrics.AddExtraInfo("HW Dictionary Pages Fetched", std::to_string(gstate.dict_pages_fetched.load()));
+		input.operator_metrics.AddExtraInfo("HW Dictionary Pages Cached", std::to_string(gstate.dict_pages_cached.load()));
 	}
 	if (gstate.hw_filter && gstate.filters) {
 		input.operator_metrics.AddExtraInfo("HW Filter Stage", std::to_string(gstate.hw_filter_stage));
 		input.operator_metrics.AddExtraInfo("HW Filter Groups", std::to_string(gstate.hw_filter_groups.load()));
 		input.operator_metrics.AddExtraInfo("HW Filter Rows In", std::to_string(gstate.hw_filter_rows_in.load()));
 		input.operator_metrics.AddExtraInfo("HW Filter Rows Out", std::to_string(gstate.hw_filter_rows_out.load()));
+	}
+	// The lookup table (stage 3 on): the regions asked for and those without room, the row groups whose
+	// bitmap had no region, the words taken and the most words of the table in use after a request
+	if (gstate.hw_filter && gstate.filters && gstate.hw_filter_stage >= 3) {
+		const auto &counters = gstate.table_counters;
+		input.operator_metrics.AddExtraInfo("HW Table Requests", std::to_string(counters.requests.load()));
+		input.operator_metrics.AddExtraInfo("HW Table Failures", std::to_string(counters.failures.load()));
+		input.operator_metrics.AddExtraInfo("HW Table Interval Fallbacks",
+		                                    std::to_string(counters.interval_fallbacks.load()));
+		input.operator_metrics.AddExtraInfo("HW Table CPU Fallbacks", std::to_string(counters.cpu_fallbacks.load()));
+		input.operator_metrics.AddExtraInfo("HW Table Words", std::to_string(counters.words.load()));
+		input.operator_metrics.AddExtraInfo("HW Table Peak Words", std::to_string(counters.peak_words_in_use.load()));
+	}
+	if (std::any_of(gstate.projected_columns.begin(), gstate.projected_columns.end(),
+	                [](const ProjectedColumn &col) { return !col.is_cpu; })) {
+		input.operator_metrics.AddExtraInfo("HW Bytes Out", std::to_string(gstate.hw_bytes_out.load()));
 	}
 }
 

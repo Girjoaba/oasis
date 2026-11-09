@@ -33,6 +33,7 @@ std::shared_ptr<FilterTableRegion> FilterTable::allocate(std::vector<uint64_t> w
         if (size > words.size()) {
             free_[base + words.size()] = size - words.size();
         }
+        used_ += words.size();
         return std::make_shared<FilterTableRegion>(shared_from_this(), base, std::move(words));
     }
     return nullptr;
@@ -47,10 +48,16 @@ size_t FilterTable::largest_free_words() const {
     return largest;
 }
 
+size_t FilterTable::words_in_use() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return used_;
+}
+
 void FilterTable::release(size_t base, size_t size) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto [it, inserted] = free_.emplace(base, size);
     assert(inserted);
+    used_ -= size;
 
     // Merge with the free ranges on both sides
     auto next = std::next(it);

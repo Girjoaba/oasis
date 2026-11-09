@@ -3,8 +3,9 @@
 # Q6 and Q14 at SF 0.01 (latency cells) and four ClickBench queries on 20000 rows of hits (throughput
 # cells, one stream): q01 (SMALLINT not-equal), q12 (strings as dictionary ids), q19 (BIGINT equality),
 # q36 (INTEGER, DATE and SMALLINT conjuncts and a string not-equal; q41 has the same conjuncts, but its
-# OFFSET skips every row of the sample). Every main mode and every stage, 2 repetitions. One Verilator
-# binary: run nothing else in the simulation meanwhile.
+# OFFSET skips every row of the sample). Every main mode, its narrow variant (oasis_narrow_transfer) and
+# every stage, 2 repetitions; then one TPC-H cell of oasis under DuckDB's log (bench --hw-log). One
+# Verilator binary: run nothing else in the simulation meanwhile.
 #
 # Usage: sim_check.sh [modes]    (default all modes; output and summary.md in $WORK/sim_check/)
 #        SUITES=clickbench sim_check.sh   only the cells of these suites (default tpch clickbench); the
@@ -21,7 +22,7 @@ SIM_WORK=$WORK
 WORK=$BENCH_WORK
 OUT=$WORK/sim_check
 BIN=$WORK/bin/bench_sim
-MODES=${1:-native_rdma oasis_nohw oasis oasis_s1 oasis_s2 oasis_s3 oasis_s4}
+MODES=${1:-native_rdma oasis_nohw oasis oasis_nohw_narrow oasis_narrow oasis_s1 oasis_s2 oasis_s3 oasis_s4}
 SUITES=${SUITES:-tpch clickbench}
 mkdir -p "$OUT" "$WORK/bin"
 
@@ -75,6 +76,18 @@ for rep in 0 1; do
         done
     done
 done
+# The hardware filter messages of oasis (analyze.py: section Hardware filter log)
+if [[ " $SUITES " == *" tpch "* ]]; then
+    name=tpch_sf0.01_oasis_t4_log_r0
+    d=$OUT/$name
+    rm -rf "$d"; mkdir -p "$d"
+    start=$SECONDS
+    (cd "$d" && timeout 3600 "$BIN" --mode oasis --server sim --threads 4 --sessions 1 --tp-reps 0 --lat-reps 1 \
+        --hw-log --queries 6,14 --seed 42 --suite "$QUERIES/tpch" --out . > bench.log 2>&1)
+    rc=$?
+    printf '%s\t%s\t%s\n' "$name" "$rc" "$((SECONDS - start))" >> "$OUT/index.tsv"
+    echo "$name rc=$rc $((SECONDS - start)) s $(tail -n 1 "$d/bench.log")"
+fi
 python3 "$BENCH_DIR/analyze.py" "$OUT" --reference native_rdma > /dev/null
 echo "analyze rc=$?: $OUT/summary.md"
 python3 "$BENCH_DIR/plot.py" "$OUT"

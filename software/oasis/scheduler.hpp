@@ -7,6 +7,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -88,6 +89,19 @@ class Scheduler {
     // Flows currently enqueued across all streams (enqueued in hardware, awaiting completion).
     [[nodiscard]] size_t in_flight_flows() const;
 
+    // Software counters of one stream since the scheduler started. They only grow, so a window is
+    // the difference of a read before and a read after it.
+    struct StreamCounters {
+        // Bytes the hardware wrote to host memory: the sum of `bytes_written` of every completion.
+        // For a DECODE stream that is the output of the FilterStage.
+        uint64_t post_filter_bytes = 0;
+        // Nanoseconds the stream had no output buffer enqueued while a flow of its capability was
+        // queued or in flight on any stream, i.e. it waited for the host. A flow enqueues its
+        // buffers before its config, so a stream with a flow always has a buffer.
+        uint64_t no_buffer_ns = 0;
+    };
+    [[nodiscard]] StreamCounters stream_counters(libstf::stream_t stream) const;
+
     // Invoked from the interrupt switch for a stream interrupt. The hardware interrupts once per
     // output buffer. This pops the front pending completion for that stream and pushes the
     // corresponding buffer onto the splinter's result channel. The interrupt for the sink's final
@@ -96,6 +110,8 @@ class Scheduler {
     void handle_completion(libstf::stream_t stream, uint32_t bytes_written, bool last);
 
   private:
+    using Clock = std::chrono::steady_clock;
+
     struct SplinterCompletion {
         std::shared_ptr<SplinterResultChannel> channel;
         std::atomic<size_t>                    outstanding_flows;
@@ -146,7 +162,9 @@ class Scheduler {
     // and the interrupt thread decrements them as completions land. Keeping them lock-free is what
     // breaks the lock cycle -- handle_completion must never take dispatch_mutex_ while the
     // dispatcher holds dispatch_mutex_ and is waiting for the stream mutex. `in_flight`/`done` are
-    // guarded by the stream mutex.
+    // guarded by the stream mutex. For the stream profile (stream_counters): `bytes_written` sums
+    // the completions, and `busy_ns`/`busy_since` time the intervals with a non-empty
+    // `completions`, under the stream mutex.
     struct StreamState {
         std::mutex                    mutex;
         std::list<InFlight>           in_flight;
@@ -155,6 +173,18 @@ class Scheduler {
         std::atomic<size_t>           enqueued_buffers{0};
         size_t                        max_flows   = 1;
         size_t                        max_buffers = 1;
+        StreamCapability              capability  = StreamCapability::DECODE;
+        std::atomic<uint64_t>         bytes_written{0};
+        uint64_t                      busy_ns = 0; // closed intervals
+        Clock::time_point             busy_since;  // start of the open interval
+    };
+
+    // The flows of one capability that are submitted and not yet concluded, and the time with at
+    // least one (closed intervals plus the start of the open one). Guarded by dispatch_mutex_.
+    struct CapabilityLoad {
+        size_t            flows   = 0;
+        uint64_t          busy_ns = 0;
+        Clock::time_point busy_since;
     };
 
     OasisContext                 &ctx_;
@@ -172,6 +202,8 @@ class Scheduler {
     // One queue per capability, so full streams of one capability never block dispatch to the
     // other. Indexed by StreamCapability.
     std::array<std::deque<Pending>, NUM_STREAM_CAPABILITIES> queues_;
+    // Indexed by StreamCapability.
+    std::array<CapabilityLoad, NUM_STREAM_CAPABILITIES> loads_;
     bool                    stop_ = false;
     std::thread             dispatcher_;
 

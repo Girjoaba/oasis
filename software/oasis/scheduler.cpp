@@ -36,6 +36,12 @@ size_t default_pipeline_depth(const std::vector<StreamDescription> &streams) {
     return 1;
 }
 
+uint64_t elapsed_ns(std::chrono::steady_clock::time_point since,
+                    std::chrono::steady_clock::time_point now) {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now - since).count());
+}
+
 } // namespace
 
 Scheduler::Scheduler(OasisContext &ctx, std::vector<StreamDescription> streams)
@@ -48,6 +54,7 @@ Scheduler::Scheduler(OasisContext &ctx, std::vector<StreamDescription> streams)
         auto state       = std::make_unique<StreamState>();
         state->max_flows   = std::max<size_t>(streams[stream].max_flows, 1);
         state->max_buffers = streams[stream].max_buffers;
+        state->capability  = streams[stream].capability;
         streams_by_capability_[capability_index(streams[stream].capability)].push_back(stream);
         streams_.push_back(std::move(state));
     }
@@ -80,6 +87,32 @@ size_t Scheduler::in_flight_flows() const {
         total += ss->enqueued.load(std::memory_order_relaxed);
     }
     return total;
+}
+
+Scheduler::StreamCounters Scheduler::stream_counters(libstf::stream_t stream) const {
+    StreamCounters counters;
+    if (stream >= num_streams_) {
+        return counters;
+    }
+    StreamState &ss            = *streams_[stream];
+    counters.post_filter_bytes = ss.bytes_written.load(std::memory_order_relaxed);
+
+    // Both locks (in the order of ~Scheduler) give one snapshot. A stream has buffers only while a
+    // flow of its capability is in flight, so its busy time lies within the time of its capability.
+    std::lock_guard<std::mutex> dlock(dispatch_mutex_);
+    std::lock_guard<std::mutex> slock(ss.mutex);
+    const auto &load    = loads_[capability_index(ss.capability)];
+    const auto  now     = Clock::now();
+    uint64_t    load_ns = load.busy_ns;
+    uint64_t    busy_ns = ss.busy_ns;
+    if (load.flows > 0) {
+        load_ns += elapsed_ns(load.busy_since, now);
+    }
+    if (!ss.completions.empty()) {
+        busy_ns += elapsed_ns(ss.busy_since, now);
+    }
+    counters.no_buffer_ns = load_ns > busy_ns ? load_ns - busy_ns : 0;
+    return counters;
 }
 
 Scheduler::~Scheduler() {
@@ -175,6 +208,10 @@ SplinterResultHandle Scheduler::submit(QuerySplinter splinter) {
         // Push every flow contiguously so the splinter's flows stay together in their queues.
         std::lock_guard<std::mutex> lock(dispatch_mutex_);
         for (auto &pending : pendings) {
+            CapabilityLoad &load = loads_[capability_index(pending.capability)];
+            if (load.flows++ == 0) {
+                load.busy_since = Clock::now();
+            }
             queues_[capability_index(pending.capability)].push_back(std::move(pending));
         }
     }
@@ -342,6 +379,9 @@ void Scheduler::dispatch_to(libstf::stream_t stream, Pending &pending) {
         // equal the enqueue (CSR) order below; both run here, on the single dispatcher thread. The
         // final buffer's completion concludes the flow.
         const auto &buffers = sink->buffers();
+        if (ss.completions.empty()) {
+            ss.busy_since = Clock::now();
+        }
         for (size_t i = 0; i < buffers.size(); ++i) {
             ss.completions.push_back(PendingCompletion{buffers[i], sink->tag(), slot->completion,
                                                        slot, i + 1 == buffers.size()});
@@ -383,10 +423,14 @@ void Scheduler::handle_completion(libstf::stream_t stream, uint32_t bytes_writte
         }
         pc = std::move(ss.completions.front());
         ss.completions.pop_front();
+        if (ss.completions.empty()) {
+            ss.busy_ns += elapsed_ns(ss.busy_since, Clock::now());
+        }
     }
 
     // This buffer's hardware output-writer slot is free again.
     ss.enqueued_buffers.fetch_sub(1, std::memory_order_relaxed);
+    ss.bytes_written.fetch_add(bytes_written, std::memory_order_relaxed);
 
     // Surface the buffer to the splinter's consumer, tagged so it lands in the right column.
     pc.buffer->size = bytes_written;
@@ -416,6 +460,10 @@ void Scheduler::handle_completion(libstf::stream_t stream, uint32_t bytes_writte
 
         {
             std::lock_guard<std::mutex> dlock(dispatch_mutex_);
+            CapabilityLoad &load = loads_[capability_index(ss.capability)];
+            if (--load.flows == 0) {
+                load.busy_ns += elapsed_ns(load.busy_since, Clock::now());
+            }
         }
         dispatch_cv_.notify_one();
     } else {

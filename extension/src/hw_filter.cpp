@@ -168,7 +168,8 @@ static std::optional<HwInterval> ConstantInterval(const Expression &expr, const 
 // (top-N) filters, OR, LIKE, a type the hardware does not compare and a column a pushed cast
 // narrowed. Independent of the row group. The stage limits what the hardware takes: 1 the
 // comparisons of the plan, 2 also those of the joins (`dynamic`), 3 also the bitmaps, 5 also the
-// Bloom filters (`bloom`, with a bitstream that takes them).
+// Bloom filters (`bloom`, with a bitstream that takes them). It also notes whether the hardware passes
+// a superset, whether DuckDB checks the rows and the threshold of a join filter (HwScanFilter).
 static HwScanFilter ClassifyHardwareFilter(ClientContext &context, oasis::FilterTable &table,
                                            const OasisScanFilter &filter, const ProjectedColumn &col,
                                            const LogicalType &scan_type, libstf::type_t transfer_type,
@@ -200,6 +201,8 @@ static HwScanFilter ClassifyHardwareFilter(ClientContext &context, oasis::Filter
 		if (auto bitmap = LookupBitmap(context, table, e, scan_type, optional, bloom)) {
 			hw.interval = HwInterval {bitmap->min, bitmap->max, false};
 			hw.bitmap = bitmap->words.empty() ? nullptr : bitmap;
+			hw.int32_key = ReadsInt32Key(e, scan_type);
+			hw.superset = !bitmap->exact;
 		}
 	};
 	// The min/max bounds, the prefix range bitmap, the Bloom filter and the IN lists of a join, and
@@ -208,6 +211,16 @@ static HwScanFilter ClassifyHardwareFilter(ClientContext &context, oasis::Filter
 	if (join_bound) {
 		classify(*join_bound, true);
 		hw.optional = hw.interval.has_value();
+		// DuckDB checks the rows of a selectivity-optional filter while it keeps at most its threshold
+		// of them, and the rows of an optional filter never
+		auto &wrapper = expr.Cast<BoundFunctionExpression>();
+		if (wrapper.Function().GetName() == SelectivityOptionalFilterScalarFun::NAME) {
+			hw.threshold = wrapper.BindInfo()->Cast<SelectivityOptionalFilterFunctionData>().selectivity_threshold;
+		} else {
+			idx_t n_vectors_to_check;
+			GetThresholdAndVectorsToCheck(SelectivityOptionalFilterType::MIN_MAX, hw.threshold, n_vectors_to_check);
+			hw.rows_checked = false;
+		}
 		return hw;
 	}
 	classify(expr, false);
@@ -270,6 +283,11 @@ std::vector<HwScanFilter> ClassifyHardwareFilters(ClientContext &context, const 
 			                 bind.metadata.column_names[col.column_id].c_str(), hw.optional ? "join " : "",
 			                 hw.interval->negate ? "not " : "", (long long)hw.interval->lo, (long long)hw.interval->hi);
 		}
+		if (hw.int32_key) {
+			DUCKDB_LOG_DEBUG(context,
+			                 "Hardware filter on column '%s': INTEGER join key, only in row groups whose values fit",
+			                 bind.metadata.column_names[col.column_id].c_str());
+		}
 	}
 	return hw_filters;
 }
@@ -312,6 +330,21 @@ static bool ChunkHasNoNulls(OasisScanLocalState &lstate, size_t group, const par
 	}
 	auto stats = ChunkStats(lstate, group, column_id);
 	return stats && !stats->CanHaveNull();
+}
+
+// Whether the chunk statistics prove that every value of a BIGINT chunk is an INTEGER key of a
+// compressed join (HwScanFilter::int32_key) that the hardware takes as DuckDB does: the cast is then
+// the identity. A Bloom filter in a 64 bit lane also needs min >= 0, since the hardware hashes the
+// 64 bit value and DuckDB the 32 bit zero extension of the key; a narrowed chunk hashes that without
+// hash64.
+static bool ChunkFitsInt32Key(OasisScanLocalState &lstate, size_t group, size_t column_id, bool bloom64) {
+	auto stats = ChunkStats(lstate, group, column_id);
+	if (!stats || !NumericStats::HasMinMax(*stats)) {
+		return false;
+	}
+	const int64_t lo = bloom64 ? 0 : NumericLimits<int32_t>::Minimum();
+	return NumericStats::GetMin<int64_t>(*stats) >= lo &&
+	       NumericStats::GetMax<int64_t>(*stats) <= NumericLimits<int32_t>::Maximum();
 }
 
 // The share of the chunk's rows that pass the interval and the bitmap if the values spread evenly
@@ -365,6 +398,8 @@ bool PlanHardwareFilter(ClientContext &context, const OasisScanGlobalState &gsta
 	// filter time on the CPU.
 	std::vector<std::optional<HwInterval>> intervals(num_hw);
 	std::vector<std::shared_ptr<const HwBitmap>> bitmaps(num_hw);
+	// Whether the bitmap of the column has INTEGER keys of a BIGINT column (HwScanFilter::int32_key)
+	std::vector<bool> int32_keys(num_hw, false);
 	std::vector<std::vector<size_t>> taken(num_hw);
 	std::vector<bool> takes_required(num_hw, false);
 	for (size_t k = 0; k < num_hw; k++) {
@@ -377,7 +412,12 @@ bool PlanHardwareFilter(ClientContext &context, const OasisScanGlobalState &gsta
 		// so without room in the table the conjuncts stay on the CPU.
 		if (col.dict_ids) {
 			const auto &id_filter = pending.dict_id_filters[i];
-			if (!id_filter || (id_filter->hw.bitmap && !id_filter->hw.bitmap->Region(gstate.ctx->filter_table()))) {
+			if (!id_filter) {
+				continue;
+			}
+			if (id_filter->hw.bitmap &&
+			    !id_filter->hw.bitmap->Region(context, gstate.ctx->filter_table(), gstate.table_counters)) {
+				gstate.table_counters.cpu_fallbacks++;
 				continue;
 			}
 			intervals[k] = id_filter->hw.interval;
@@ -410,17 +450,28 @@ bool PlanHardwareFilter(ClientContext &context, const OasisScanGlobalState &gsta
 			if (candidate.negate && candidates.size() > 1) {
 				continue;
 			}
+			// The INTEGER key of a compressed join only where the cast is the identity; its values then
+			// lie in the 32 bit range, whose interval passes the lane
+			if (hw.int32_key &&
+			    !ChunkFitsInt32Key(lstate, pending.group, col.column_id, hw.bitmap && hw.bitmap->bloom && !lane32)) {
+				DUCKDB_LOG_DEBUG(context,
+				                 "Row group %llu on the CPU filter for column '%s': the INTEGER join key does not fit",
+				                 (unsigned long long)pending.group, bind.metadata.column_names[col.column_id].c_str());
+				continue;
+			}
 			if (hw.bitmap && (bitmaps[k] || (lane32 && !hw.bitmap->bloom &&
 			                                 uint64_t(hw.bitmap->max) - uint64_t(hw.bitmap->min) > UINT32_MAX))) {
 				continue;
 			}
-			if (hw.bitmap && (!hw.optional || (hw.bitmap->bloom && PassesLane(candidate, lane32))) &&
-			    !hw.bitmap->Region(gstate.ctx->filter_table())) {
+			if (hw.bitmap && (!hw.optional || (hw.bitmap->bloom && PassesLane(candidate, lane32 || hw.int32_key))) &&
+			    !hw.bitmap->Region(context, gstate.ctx->filter_table(), gstate.table_counters)) {
+				gstate.table_counters.cpu_fallbacks++;
 				continue;
 			}
 			interval = interval ? Intersect(*interval, candidate) : candidate;
 			if (hw.bitmap) {
 				bitmaps[k] = hw.bitmap;
+				int32_keys[k] = hw.int32_key;
 			}
 			taken[k].push_back(f);
 			takes_required[k] = takes_required[k] || !hw.optional;
@@ -482,9 +533,15 @@ bool PlanHardwareFilter(ClientContext &context, const OasisScanGlobalState &gsta
 	}
 
 	// Take the group when the statistics expect at most the share of passing rows at which DuckDB
-	// still evaluates a min/max filter.
+	// still evaluates the join filter (HwScanFilter::threshold): the interval against the largest
+	// threshold of the conjuncts without a bitmap, the bitmap against the threshold of its prefix range
+	// or Bloom filter. The bitmap counts only with its region, else the interval goes alone.
 	if (!any_required) {
+		float min_max_threshold;
+		idx_t n_vectors_to_check;
+		GetThresholdAndVectorsToCheck(SelectivityOptionalFilterType::MIN_MAX, min_max_threshold, n_vectors_to_check);
 		double pass_fraction = 1;
+		bool selective = false;
 		for (size_t k = 0; k < num_hw; k++) {
 			if (!intervals[k]) {
 				continue;
@@ -492,16 +549,31 @@ bool PlanHardwareFilter(ClientContext &context, const OasisScanGlobalState &gsta
 			const size_t i = pending.hw_slot[k];
 			if (gstate.projected_columns[i].dict_ids) {
 				pass_fraction = std::min(pass_fraction, pending.dict_id_filters[i]->pass_fraction);
+				selective = selective || pending.dict_id_filters[i]->pass_fraction <= min_max_threshold;
 				continue;
 			}
-			pass_fraction = std::min(pass_fraction, EstimatedPassFraction(lstate, pending.group,
-			                                                              gstate.projected_columns[i].column_id,
-			                                                              *intervals[k], bitmaps[k].get()));
+			float interval_threshold = 0;
+			float bitmap_threshold = 0;
+			for (size_t f : taken[k]) {
+				const auto &hw = lstate.scan_filters[f].hw;
+				auto &threshold = hw.bitmap ? bitmap_threshold : interval_threshold;
+				threshold = std::max(threshold, hw.threshold);
+			}
+			const size_t column_id = gstate.projected_columns[i].column_id;
+			const double interval_fraction =
+			    EstimatedPassFraction(lstate, pending.group, column_id, *intervals[k], nullptr);
+			pass_fraction = std::min(pass_fraction, interval_fraction);
+			selective = selective || interval_fraction <= interval_threshold;
+			if (bitmaps[k]) {
+				const double bitmap_fraction =
+				    EstimatedPassFraction(lstate, pending.group, column_id, *intervals[k], bitmaps[k].get());
+				pass_fraction = std::min(pass_fraction, bitmap_fraction);
+				selective = selective ||
+				            (bitmap_fraction <= bitmap_threshold &&
+				             bitmaps[k]->Region(context, gstate.ctx->filter_table(), gstate.table_counters));
+			}
 		}
-		float threshold;
-		idx_t n_vectors_to_check;
-		GetThresholdAndVectorsToCheck(SelectivityOptionalFilterType::MIN_MAX, threshold, n_vectors_to_check);
-		if (pass_fraction > threshold) {
+		if (!selective) {
 			DUCKDB_LOG_DEBUG(context,
 			                 "Row group %llu on the CPU filter: the join bounds keep an estimated %.3f of the rows",
 			                 (unsigned long long)pending.group, pass_fraction);
@@ -561,20 +633,36 @@ bool PlanHardwareFilter(ClientContext &context, const OasisScanGlobalState &gsta
 		}
 		// An optional bitmap without room in the table leaves the interval alone, a superset
 		if (bitmaps[k]) {
-			spec.lookup = bitmaps[k]->Region(gstate.ctx->filter_table());
+			spec.lookup = bitmaps[k]->Region(context, gstate.ctx->filter_table(), gstate.table_counters);
+			if (!spec.lookup) {
+				gstate.table_counters.interval_fallbacks++;
+			}
 		}
 		if (spec.lookup && bitmaps[k]->bloom) {
-			// The hash of DuckDB: of the 64 bit key of a BIGINT column also in a chunk narrowed to 32 bit lanes
+			// The hash of DuckDB: of the 64 bit key of a BIGINT column also in a chunk narrowed to 32 bit lanes,
+			// of the 32 bit key of an INTEGER join key
 			const auto &col = gstate.projected_columns[pending.hw_slot[k]];
 			spec.bloom = true;
-			spec.hash64 = bind.output_types[col.column_id].InternalType() == PhysicalType::INT64;
+			spec.hash64 = bind.output_types[col.column_id].InternalType() == PhysicalType::INT64 && !int32_keys[k];
 		} else if (spec.lookup) {
 			spec.lut_min = bitmaps[k]->min;
 			spec.shift = bitmaps[k]->shift;
 		}
 		spec.load_sel = k != order.front();
 		spec.emit = hw_emit[pending.hw_slot[k]];
+		// A conjunct the hardware passes a superset of keeps DuckDB's check on the CPU, which filters
+		// the compacted vectors, if DuckDB checks its rows and the column is emitted anyway: a bitmap
+		// that is not exact, also as its interval alone, or a bitmap without its region
+		const bool dict_ids = gstate.projected_columns[pending.hw_slot[k]].dict_ids;
 		for (size_t f : taken[k]) {
+			const auto &hw = lstate.scan_filters[f].hw;
+			const bool superset = hw.superset || (hw.bitmap && bitmaps[k] && !spec.lookup);
+			if (superset && hw.rows_checked && spec.emit && !dict_ids) {
+				DUCKDB_LOG_DEBUG(context, "Row group %llu: column '%s' also on the CPU, the hardware passes a superset",
+				                 (unsigned long long)pending.group,
+				                 bind.metadata.column_names[gstate.projected_columns[pending.hw_slot[k]].column_id].c_str());
+				continue;
+			}
 			pending.needs_row_filter[f] = false;
 		}
 		DUCKDB_LOG_DEBUG(context, "Row group %llu: column '%s' %s", (unsigned long long)pending.group,

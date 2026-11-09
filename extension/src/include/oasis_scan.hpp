@@ -50,10 +50,28 @@ struct HwInterval {
 	bool negate = false;
 };
 
+// What the bitmaps of one scan take of the lookup table of the FilterStages, summed over its workers
+// (HwBitmap::Region, PlanHardwareFilter) and reported with the metrics of the scan.
+struct HwTableCounters {
+	// The regions asked for, one per bitmap at the first row group that looks it up, and those the
+	// table had no room for.
+	std::atomic<uint64_t> requests {0};
+	std::atomic<uint64_t> failures {0};
+	// The row groups whose bitmap had no region: an optional bitmap went as its interval alone, the
+	// conjuncts of a required one (or of the Bloom filter of a join) stayed on the CPU.
+	std::atomic<uint64_t> interval_fallbacks {0};
+	std::atomic<uint64_t> cpu_fallbacks {0};
+	// The words of the regions taken, and the most words of the table in use (every scan and session)
+	// after a request of this scan.
+	std::atomic<uint64_t> words {0};
+	std::atomic<uint64_t> peak_words_in_use {0};
+};
+
 // A yes/no bitmap the FilterStage looks the values of a column up in (hw_bitmap.hpp): a value x with
 // min <= x <= max passes if bit (x - min) >> shift of `words` is set. The bitmap of a filter that is
 // not optional passes the values of the filter and no other; else it may pass a superset, as a folded
-// prefix range bitmap of a join, whose rows the join checks again. With bloom, `words` is a Bloom
+// prefix range bitmap of a join, whose rows the join checks again (and the CPU, when the column is
+// emitted: HwScanFilter::superset). With bloom, `words` is a Bloom
 // filter of 2^k words in place of the bitmap (hw_bloom.hpp), optional only, and shift is unused.
 struct HwBitmap {
 	int64_t min;
@@ -67,6 +85,11 @@ struct HwBitmap {
 	double bloom_pass = 1;
 	// The number of keys of a Bloom filter, estimated from its set bits for the filter of a join.
 	double bloom_keys = 0;
+	// Whether min, max and the words pass the values of the filter and no other: a bitmap of shift 0,
+	// or one that sets every bit, and the Bloom filter of a join copied without a fold. Not for a folded
+	// bitmap, the Bloom filter of the keys of a prefix range filter and the interval alone of a bitmap
+	// that sets about every bit.
+	bool exact = false;
 
 	// The share of set bits among the bits of the values lo to hi, which lie in [min, max].
 	double OnesFraction(int64_t lo, int64_t hi) const;
@@ -77,11 +100,18 @@ struct HwBitmap {
 
 	// The region of the lookup table that holds the words, taken by the first row group that looks
 	// the bitmap up, so that a bitmap no group uses holds no room. Null when the table had no room
-	// then; every later call returns the same.
-	std::shared_ptr<oasis::FilterTableRegion> Region(oasis::FilterTable &table) const;
+	// then, or after ReleaseRegion; every later call returns the same. The request goes into counters
+	// and the debug log.
+	std::shared_ptr<oasis::FilterTableRegion> Region(ClientContext &context, oasis::FilterTable &table,
+	                                                 HwTableCounters &counters) const;
+
+	// Drops the region, which returns to the table when the last flow that looks it up is done (its
+	// FilterSpec holds it). The words it held, 0 without a region.
+	size_t ReleaseRegion() const;
 
 private:
-	mutable std::once_flag region_allocated;
+	mutable std::mutex region_lock;
+	mutable bool region_requested = false;
 	mutable std::shared_ptr<oasis::FilterTableRegion> region;
 };
 
@@ -96,6 +126,20 @@ struct HwScanFilter {
 	// The bitmap the hardware looks the values up in, with interval its [min, max]: a prefix range
 	// filter of a hash join, an IN list or the Bloom filter of a hash join. Null for a comparison.
 	std::shared_ptr<const HwBitmap> bitmap;
+	// Whether interval and bitmap may pass values the filter drops: a bitmap that is not exact, also as
+	// its interval alone. A bitmap without its region also passes a superset (PlanHardwareFilter).
+	bool superset = false;
+	// Whether DuckDB checks the rows of the filter in the scan: not for an optional filter, which passes
+	// every row on the CPU and serves the statistics only.
+	bool rows_checked = true;
+	// The largest estimated share of passing rows at which the hardware takes an optional filter alone:
+	// the threshold above which DuckDB stops checking it (GetThresholdAndVectorsToCheck), 0.9 for the
+	// min/max bounds and 0.5 for a prefix range or Bloom filter of a hash join.
+	float threshold = 1;
+	// Whether the filter reads a BIGINT column as the INTEGER key of a compressed join (ReadsInt32Key of
+	// hw_bitmap.hpp): interval and bitmap hold for a chunk only if every value fits, where the cast is the
+	// identity, and a Bloom filter hashes INTEGER keys (PlanHardwareFilter).
+	bool int32_key = false;
 };
 
 // The ids of a dictionary that pass the conjuncts of a dictionary id column (hw_dictionary.hpp), evaluated
@@ -234,6 +278,10 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	// bounds of the joins, 3 the bitmaps, 4 the string columns as their dictionary ids, 5 the Bloom filters.
 	uint64_t hw_filter_stage = 0;
 
+	// Whether the decoded dictionaries of the dictionary id columns go to DuckDB's object cache, shared by
+	// the scans of every connection (oasis_dict_cache, hw_dictionary.hpp).
+	bool dict_cache = false;
+
 	// Dynamic join filters (min/max pushed by hash joins into the probe-side scan). Our global
 	// state is created at schedule time (INITIALIZE_ON_SCHEDULE), before the build side has run,
 	// so PhysicalTableScan's own dynamic-filter merge sees an empty set and drops them. Instead we
@@ -245,12 +293,25 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 
 	// What the hardware takes of each filter, one entry per filter of BuildScanFilters, in its order:
 	// classified once, after the dynamic filter merge (ClassifyHardwareFilters). The regions of the
-	// bitmaps return to the lookup table when the scan and its flows are done.
+	// bitmaps return to the lookup table when DuckDB frees this state, at the end of the query (it
+	// never calls Pipeline::ClearSource), and their flows are done; with table_early_release when the
+	// scan is done (CloseGroup).
 	std::vector<HwScanFilter> hw_filters;
+
+	// oasis_filter_table_early_release: the regions of hw_filters return to the lookup table once the
+	// last row group of the scan is collected, so that a later scan of the query finds the room.
+	bool table_early_release = false;
+	// What the bitmaps of the scan take of the lookup table. Mutable: PlanHardwareFilter and the
+	// classification take the state const.
+	mutable HwTableCounters table_counters;
 
 	// Row-group cursor: the next group to hand out. Claimed atomically by workers.
 	std::atomic<size_t> next_group {0};
 	size_t total_groups = 0;
+	// The row groups claimed and not yet collected, with the claim in progress of each worker: when it
+	// drops to 0 after the cursor ran out, no group of the scan looks a region up any more.
+	std::atomic<size_t> groups_open {0};
+	std::once_flag scan_done;
 
 	size_t groups_in_flight_per_worker = 1;
 
@@ -269,6 +330,9 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	std::atomic<uint64_t> hw_filter_groups {0};
 	std::atomic<uint64_t> hw_filter_rows_in {0};
 	std::atomic<uint64_t> hw_filter_rows_out {0};
+	std::atomic<uint64_t> hw_bytes_out {0};
+	std::atomic<uint64_t> dict_pages_fetched {0};
+	std::atomic<uint64_t> dict_pages_cached {0};
 
 	idx_t MaxThreads() const override {
 		return total_groups == 0 ? 1 : total_groups;
@@ -339,6 +403,17 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 		std::vector<GroupDictionary> dictionaries;
 		std::vector<std::shared_ptr<const DictIdFilter>> dict_id_filters;
 
+		// The dictionary pages fetched over RDMA (LookupDictionaries): dict_slot the projection indexes,
+		// dict_buffers per projection index the page. The group's splinter fetches them as bypass flows,
+		// tagged with the number of projected columns plus the projection index. When the conjuncts of a
+		// column need its dictionary before the group is submitted, a splinter of their own (dict_result)
+		// fetches them, and the group is submitted once they are in (awaiting_dictionaries).
+		std::vector<size_t> dict_slot;
+		std::vector<std::vector<std::shared_ptr<libstf::Buffer>>> dict_buffers;
+		oasis::SplinterResultHandle dict_result;
+		size_t dict_batches_remaining = 0;
+		bool awaiting_dictionaries = false;
+
 		oasis::SplinterResultHandle result;
 		bool submitted = false;
 		size_t batches_remaining = 0;
@@ -367,6 +442,10 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 	std::vector<GroupDictionary> current_dictionaries;
 	std::vector<std::shared_ptr<const DictIdFilter>> current_dict_id_filters;
 
+	// The file in the keys of the cached dictionaries: its path, size and last modification. Empty when
+	// the scan caches no dictionary.
+	string dict_cache_file;
+
 	size_t current_buf_offset = 0;
 	size_t current_group_num_rows = 0;
 	idx_t current_group = 0;
@@ -378,6 +457,11 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 	uint64_t hw_filter_groups = 0;
 	uint64_t hw_filter_rows_in = 0;
 	uint64_t hw_filter_rows_out = 0;
+	// Bytes the hardware wrote for the decoded columns of this worker's groups (after the FilterStage).
+	uint64_t hw_bytes_out = 0;
+	// Dictionary pages of the dictionary id columns read or fetched, and taken from the cache.
+	uint64_t dict_pages_fetched = 0;
+	uint64_t dict_pages_cached = 0;
 };
 
 void RegisterOasisScanFunction(ExtensionLoader &loader);

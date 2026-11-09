@@ -30,6 +30,11 @@ struct ProfileRow {
 	double in_throughput_excl_idle_gbps;  // excluding inter-stream idle cycles
 	double out_throughput_gbps;
 	double out_throughput_excl_idle_gbps;
+
+	// Software counters of the scheduler (oasis::Scheduler::StreamCounters). Unlike the hardware
+	// counters they are not reset by a read: they count since the Oasis context opened.
+	uint64_t post_filter_bytes = 0;
+	uint64_t no_buffer_ns = 0;
 };
 
 // Bytes transported divided by the time spent over `cycles` clock cycles, in GB/s. Returns 0 when
@@ -123,6 +128,9 @@ void DefineColumns(vector<Identifier> &names, vector<LogicalType> &types) {
 	add("in_throughput_excl_idle_gbps", LogicalType::DOUBLE);
 	add("out_throughput_gbps", LogicalType::DOUBLE);
 	add("out_throughput_excl_idle_gbps", LogicalType::DOUBLE);
+
+	add("post_filter_bytes", LogicalType::UBIGINT);
+	add("no_buffer_ns", LogicalType::UBIGINT);
 }
 
 unique_ptr<FunctionData> OasisProfileBind(ClientContext &context, TableFunctionBindInput &input,
@@ -155,6 +163,14 @@ unique_ptr<GlobalTableFunctionState> OasisProfileInitGlobal(ClientContext &conte
 		if (generic->has_bypass_profile()) {
 			gstate->rows.push_back(MakeBypassRow(num_decoders, generic->read_bypass_profile()));
 		}
+	}
+
+	// The scheduler numbers its streams as the rows do: the decoders, then the bypass stream.
+	auto &scheduler = ctx.scheduler();
+	for (auto &row : gstate->rows) {
+		auto counters = scheduler.stream_counters(static_cast<libstf::stream_t>(row.stream));
+		row.post_filter_bytes = counters.post_filter_bytes;
+		row.no_buffer_ns = counters.no_buffer_ns;
 	}
 
 	return std::move(gstate);
@@ -199,6 +215,9 @@ void OasisProfileFunction(ClientContext &context, TableFunctionInput &data_p, Da
 		output.data[col++].SetValue(i, in_f64(row.in_throughput_excl_idle_gbps));
 		output.data[col++].SetValue(i, Value::DOUBLE(row.out_throughput_gbps));
 		output.data[col++].SetValue(i, Value::DOUBLE(row.out_throughput_excl_idle_gbps));
+
+		output.data[col++].SetValue(i, Value::UBIGINT(row.post_filter_bytes));
+		output.data[col++].SetValue(i, Value::UBIGINT(row.no_buffer_ns));
 	}
 
 	gstate.offset += count;

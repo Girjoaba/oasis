@@ -18,9 +18,11 @@ std::vector<HwScanFilter> ClassifyHardwareFilters(ClientContext &context, const 
 
 // Decides whether `pending`'s row group is filtered in hardware and plans it: the FilterSpec of
 // every hardware column chunk, the order the chunks go to the decoder in, which columns the
-// hardware emits and which conjuncts it takes (their needs_row_filter entries become false).
+// hardware emits and which conjuncts it takes (their needs_row_filter entries become false, except
+// for a conjunct of an emitted column that the hardware passes a superset of, HwScanFilter::superset).
 // Returns false, leaving pending as it is, when the group takes the CPU path: no conjunct the
-// hardware can take, only optional join bounds that the statistics expect to keep most rows, more
+// hardware can take, only optional join bounds that the statistics expect to keep more rows than
+// DuckDB's threshold of the filter (HwScanFilter::threshold), more
 // rows than the selection bitmap holds, or an emitted column of a type the hardware cannot select.
 // Takes the table region of a bitmap the group looks up first.
 bool PlanHardwareFilter(ClientContext &context, const OasisScanGlobalState &gstate, OasisScanLocalState &lstate,

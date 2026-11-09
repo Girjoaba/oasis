@@ -72,6 +72,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "filters (5) a FilterStage that takes Bloom filters.",
 	    LogicalType::UBIGINT, Value::UBIGINT(HW_FILTER_MAX_STAGE));
 	config.AddExtensionOption(
+	    "oasis_dict_cache",
+	    "Whether read_oasis keeps the decoded dictionaries of the string columns it reads as their dictionary "
+	    "ids (oasis_hw_filter_stage 4) in DuckDB's object cache, keyed by the file, its size and modification "
+	    "time and the dictionary page, so that later scans of every connection skip the fetch of the page.",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption(
+	    "oasis_filter_table_early_release",
+	    "Whether a read_oasis scan returns the regions of its bitmaps and Bloom filters to the lookup table of "
+	    "the FilterStages once its last row group is collected, instead of at the end of the query, so that a "
+	    "later scan of the same query or another session finds the room.",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption(
 	    "oasis_cast_pushdown",
 	    "Whether read_oasis accepts integer narrowing casts that DuckDB pushes into the scan (e.g. BIGINT "
 	    "join keys cast to INTEGER) when the file statistics prove that all values fit, and decodes the "

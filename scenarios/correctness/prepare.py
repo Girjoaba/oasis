@@ -11,6 +11,17 @@ read_parquet (DuckDB's own reader) and counts the rows that differ in either dir
 - edge: the edge cases of CASES over rdma://. Every case must give 0 differing rows.
 - edge_stages: the cases of STAGE_CASES at every oasis_hw_filter_stage, each with 0 differing rows,
   and a check of the log that no stage uses a feature of a later stage.
+- edge_table: the cases of TABLE_CASES with oasis_filter_table_early_release off and on, each with 0
+  differing rows, and checks of the lookup table messages of the log.
+- edge_dict_cache: the cases of DICT_CACHE_CASES with oasis_dict_cache off, off with
+  oasis_prefetch_depth = 0 and on, each with 0 differing rows, and checks of the dictionary page
+  messages of the log.
+- edge_lossy: the cases of LOSSY_CASES at stages 3 and 5, each with 0 differing rows, filtered in
+  hardware, with the CPU check of a join filter that the hardware passes a superset of (folded
+  bitmap, Bloom filter, bitmap without room in the table) and without it for an exact bitmap.
+- edge_prof: the cases of PROF_CASES, with the bytes that oasis_stream_profile() counts for the
+  decoders between two reads (post_filter_bytes): 4 per value of an INTEGER column without a
+  filter, under a tenth of that with a selective hardware filter.
 - gap_<case>: one scenario per input of GAPS, which the decoder does not support yet. The case
   must give 0 differing rows or fail with an error, never wrong rows. One scenario each, so a
   case that hangs or crashes the shell does not hide the others.
@@ -141,6 +152,24 @@ DUCKDB_FILES: Dict[str, Tuple[str, str]] = {
         SELECT i::INTEGER AS c_id, (1000000000000 + i::BIGINT * 1000003)::BIGINT AS c_k64,
                (i * 31 % 1000)::INTEGER AS c_val
         FROM range({BLOOM_BIG_ROWS}) r(i)""", f", ROW_GROUP_SIZE {RG}"),
+    # Join keys that a join reads as INTEGER, as DuckDB reads compressed join keys: BIGINT c_kneg and
+    # c_ksmall with the same values as INTEGER c_k32 and c_ks32, c_kbig. Distinct positive values in
+    # [1, 10^9 + 7] (c_ksmall in [1, 250 000], a span the lookup table holds unfolded), except the
+    # odd rows of row group 4, negative in c_kneg and c_ksmall, and of row group 7, above INT32_MAX in c_kbig.
+    "e_tc": (f"""
+        SELECT i::INTEGER AS c_id, k::BIGINT AS c_kneg, k::INTEGER AS c_k32,
+               (CASE WHEN i // {RG} = 7 AND i % 2 = 1 THEN abs(k) + 3000000000 ELSE abs(k) END)::BIGINT AS c_kbig,
+               s::BIGINT AS c_ksmall, s::INTEGER AS c_ks32, (i * 31 % 1000)::INTEGER AS c_val
+        FROM (SELECT i, sg * (i::BIGINT * 104729 % 1000000007 + 1) AS k, sg * (i * 37 % 250000 + 1) AS s
+              FROM (SELECT i, CASE WHEN i // {RG} = 4 AND i % 2 = 1 THEN -1 ELSE 1 END AS sg
+                    FROM range({MANY_RG_ROWS}) r(i)))""", f", ROW_GROUP_SIZE {RG}"),
+    # Lossy hardware forms: the prefix range bitmap of c_k23 over its span of 473 847 keys takes 7 404
+    # words unfolded, more than a third of the lookup table, so three such bitmaps in one query do not
+    # all fit. c_f is a filter-only column for a required conjunct.
+    "e_lx": (f"""
+        SELECT i::INTEGER AS c_id, (i * 23)::INTEGER AS c_k23,
+               (i * 31 % 1000)::INTEGER AS c_val, (i % 10)::INTEGER AS c_f
+        FROM range({MANY_RG_ROWS}) r(i)""", f", ROW_GROUP_SIZE {RG}"),
     # Hardware strings as their dictionary ids: low cardinality strings whose dictionary order changes
     # per row group (the first row of a group fixes it), empty and multi-byte strings, about 3 000
     # values (dictionaries of many words), c_gap with 'b' only in the odd row groups inside the [min,
@@ -153,6 +182,16 @@ DUCKDB_FILES: Dict[str, Tuple[str, str]] = {
                CASE WHEN (i // {RG}) % 2 = 0 THEN ['a', 'c'][1 + i % 2] ELSE ['a', 'b', 'c'][1 + i % 3] END AS c_gap,
                CASE WHEN i % 1000 = 0 THEN NULL ELSE 'u' || i END AS c_plain
         FROM range({MANY_RG_ROWS}) r(i)""", f", ROW_GROUP_SIZE {RG}, DICTIONARY_SIZE_LIMIT 4096"),
+    # Dictionary cache: two files whose c_mode differs by a shift of every letter, which keeps the lengths,
+    # the order and the repeats of the strings, so that the dictionary pages lie at the same offsets with
+    # the same sizes but hold other strings (main checks the layout). The dictionary order changes per row
+    # group.
+    "e_dc_a": (f"""
+        SELECT i::INTEGER AS c_id, ['MAIL', 'SHIP', 'AIR', 'RAIL'][1 + (i + i // {RG}) % 4] AS c_mode
+        FROM range(4 * {RG}) r(i)""", f", ROW_GROUP_SIZE {RG}"),
+    "e_dc_b": (f"""
+        SELECT i::INTEGER AS c_id, ['NBJM', 'TIJQ', 'BJS', 'SBJM'][1 + (i + i // {RG}) % 4] AS c_mode
+        FROM range(4 * {RG}) r(i)""", f", ROW_GROUP_SIZE {RG}"),
     # Known gaps.
     "g_nulls": ("""
         SELECT i::INTEGER AS c_id,
@@ -202,6 +241,18 @@ def write_pyarrow_files(data: Path) -> None:
     # Gap: data page header V2.
     pq.write_table(table(5000), data / "g_pa_v2page.parquet", use_dictionary=False,
                    compression="snappy", data_page_version="2.0")
+
+
+def same_dictionary_pages(data: Path, a: str, b: str, column: int) -> bool:
+    """Whether the dictionary pages of the column lie at the same offsets with the same sizes in both files."""
+    import pyarrow.parquet as pq
+
+    def pages(name: str) -> List[Tuple[int, int]]:
+        meta = pq.ParquetFile(data / f"{name}.parquet").metadata
+        return [(meta.row_group(g).column(column).dictionary_page_offset,
+                 meta.row_group(g).column(column).data_page_offset) for g in range(meta.num_row_groups)]
+
+    return pages(a) == pages(b)
 
 
 # Edge cases: name -> query. {f} is the source of file f (read_oasis or read_parquet).
@@ -345,6 +396,58 @@ CASES: Dict[str, str] = {
                      JOIN (SELECT c_k64 FROM {e_bloom} WHERE c_val >= 100 AND c_val < 300) c ON a.c_k64 = c.c_k64""",
     "hwf_bf_fold": """SELECT a.c_id, a.c_val FROM {e_bloom_big} a
                       JOIN (SELECT c_k64 FROM {e_bloom_big} WHERE c_val < 460) b ON a.c_k64 = b.c_k64""",
+    # A BIGINT probe key cast to the INTEGER build key: DuckDB pushes its filters on
+    # TRY_CAST(column AS INTEGER), as for compressed join keys. The hardware takes them only in the row
+    # groups whose values the cast keeps: the Bloom filter not in row group 4 (negative keys, which the
+    # hardware would hash as 64 bit values) nor in row group 7 of c_kbig (above INT32_MAX, TRY_CAST
+    # gives NULL); the prefix range bitmap of c_ksmall also in row group 4.
+    "hwf_tc_bf": """SELECT a.c_id, a.c_kneg FROM {e_tc} a
+                    JOIN (SELECT c_k32 FROM {e_tc} WHERE c_val < 100) b ON a.c_kneg::INTEGER = b.c_k32""",
+    "hwf_tc_bf_big": """SELECT a.c_id, a.c_kbig FROM {e_tc} a
+                        JOIN (SELECT c_k32 FROM {e_tc} WHERE c_val < 100) b ON TRY_CAST(a.c_kbig AS INTEGER) = b.c_k32""",
+    "hwf_tc_prf": """SELECT a.c_id, a.c_ksmall FROM {e_tc} a
+                     JOIN (SELECT c_ks32 FROM {e_tc} WHERE c_val < 100) b ON a.c_ksmall::INTEGER = b.c_ks32""",
+    # Lossy hardware forms (edge_lossy): the hardware passes a superset of the join filter, so the CPU
+    # checks the rows of the emitted key again. A folded prefix range bitmap (stages 3 and 4; the Bloom
+    # filter of its keys at stage 5), a Bloom filter of a join folded to half the table, and three
+    # unfolded bitmaps of which one folds or finds no room in the table and goes as its interval alone
+    # (a required conjunct on c_f takes the group). An unfolded bitmap is exact and keeps no CPU check.
+    # The interval alone of a dense prefix range filter keeps 76 % of row group 1, more than DuckDB's
+    # threshold of 0.5 for a prefix range filter: that group stays on the CPU, row group 0 does not.
+    "hwf_lx_fold": """SELECT a.c_id, a.c_kwide FROM {e_prf} a
+                      JOIN (SELECT c_kwide FROM {e_prf} WHERE c_id % 7 = 0) b ON a.c_kwide = b.c_kwide""",
+    "hwf_lx_bloom": """SELECT a.c_id, a.c_k64 FROM {e_bloom_big} a
+                       JOIN (SELECT c_k64 FROM {e_bloom_big} WHERE c_val < 470) b ON a.c_k64 = b.c_k64""",
+    "hwf_lx_noregion": """SELECT 1 AS q, a.c_id, a.c_k23 FROM {e_lx} a
+                          JOIN (SELECT c_k23 FROM {e_lx} WHERE c_val < 150) b ON a.c_k23 = b.c_k23 WHERE a.c_f < 9
+                          UNION ALL SELECT 2, a.c_id, a.c_k23 FROM {e_lx} a
+                          JOIN (SELECT c_k23 FROM {e_lx} WHERE c_val >= 850) b ON a.c_k23 = b.c_k23 WHERE a.c_f < 9
+                          UNION ALL SELECT 3, a.c_id, a.c_k23 FROM {e_lx} a
+                          JOIN (SELECT c_k23 FROM {e_lx} WHERE c_val >= 400 AND c_val < 550) b ON a.c_k23 = b.c_k23
+                          WHERE a.c_f < 9""",
+    "hwf_lx_exact": """SELECT a.c_id, a.c_k23 FROM {e_lx} a
+                       JOIN (SELECT c_k23 FROM {e_lx} WHERE c_val < 150) b ON a.c_k23 = b.c_k23""",
+    "hwf_lx_gate": """SELECT a.c_id, a.c_val FROM {e_prf} a
+                      JOIN (SELECT c_id FROM {e_prf} WHERE c_double BETWEEN 1000 AND 1800) b ON a.c_id = b.c_id""",
+    # The lookup table fills (edge_table): the Bloom filter of each join on e_bloom_big folds to half the
+    # table, and a statement holds its regions until it ends unless oasis_filter_table_early_release
+    # returns them when their scan is done. Three such joins in one statement, then two next to a prefix
+    # range bitmap, an IN list and the bitmap of a dictionary id column, which then fold more, go as their
+    # interval alone or stay on the CPU.
+    "hwf_tb_bloom3": """SELECT 1 AS q, a.c_id FROM {e_bloom_big} a
+                        JOIN (SELECT c_k64 FROM {e_bloom_big} WHERE c_val < 460) b ON a.c_k64 = b.c_k64
+                        UNION ALL SELECT 2, a.c_id FROM {e_bloom_big} a
+                        JOIN (SELECT c_k64 FROM {e_bloom_big} WHERE c_val >= 500 AND c_val < 960) b ON a.c_k64 = b.c_k64
+                        UNION ALL SELECT 3, a.c_id FROM {e_bloom_big} a
+                        JOIN (SELECT c_k64 FROM {e_bloom_big} WHERE c_val >= 40 AND c_val < 500) b ON a.c_k64 = b.c_k64""",
+    "hwf_tb_mixed": """SELECT 1 AS q, a.c_id FROM {e_bloom_big} a
+                       JOIN (SELECT c_k64 FROM {e_bloom_big} WHERE c_val < 460) b ON a.c_k64 = b.c_k64
+                       UNION ALL SELECT 2, a.c_id FROM {e_bloom_big} a
+                       JOIN (SELECT c_k64 FROM {e_bloom_big} WHERE c_val >= 500 AND c_val < 960) b ON a.c_k64 = b.c_k64
+                       UNION ALL SELECT 3, a.c_id FROM {e_prf} a
+                       JOIN (SELECT c_k32 FROM {e_prf} WHERE c_val < 150 AND c_id < 6000) b ON a.c_k32 = b.c_k32
+                       UNION ALL SELECT 4, c_id FROM {e_prf} WHERE c_val IN (3, 77, 150, 151, 500, 999)
+                       UNION ALL SELECT 5, c_id FROM {e_dict} WHERE c_many LIKE '%3'""",
     "hws_eq": "SELECT c_id, c_mode FROM {e_dict} WHERE c_mode = 'SHIP'",
     "hws_ne": "SELECT c_id, c_mode FROM {e_dict} WHERE c_mode <> 'SHIP'",
     "hws_range": "SELECT c_id, c_mode FROM {e_dict} WHERE c_mode < 'RAIL'",
@@ -372,13 +475,25 @@ CASES: Dict[str, str] = {
     "hws_group": "SELECT c_mode, count(*) AS n, sum(c_val) AS s FROM {e_dict} WHERE c_val > 100 GROUP BY c_mode",
     # A CPU string column in the scan: the hardware filter is off, the CPU looks the dictionary ids up.
     "hws_plain_next": "SELECT c_id, c_mode, c_plain FROM {e_dict} WHERE c_mode = 'AIR'",
+    # The dictionary pages and their cache (oasis_dict_cache): two scans of one dictionary id column in a
+    # query, with a conjunct (its pages come before the row group is submitted) and without (with the row
+    # group); then two files whose pages lie at the same offsets with the same sizes, with and without a
+    # conjunct, whose strings must not mix in the cache.
+    "hws_dc_self": """SELECT a.c_id, a.c_mode, b.c_mode AS b_mode FROM {e_dict} a
+                      JOIN {e_dict} b ON a.c_id = b.c_id + 1 WHERE b.c_mode = 'AIR'""",
+    "hws_dc_union": """SELECT 1 AS q, c_id, c_mode FROM {e_dict} WHERE c_mode IN ('RAIL', 'FOB')
+                       UNION ALL SELECT 2, c_id, c_mode FROM {e_dict} WHERE c_val < 100""",
+    "hws_dc_files_filter": """SELECT 'a' AS f, c_id, c_mode FROM {e_dc_a} WHERE c_mode >= 'S'
+                              UNION ALL SELECT 'b', c_id, c_mode FROM {e_dc_b} WHERE c_mode >= 'S'""",
+    "hws_dc_files": """SELECT 'a' AS f, c_id, c_mode FROM {e_dc_a}
+                       UNION ALL SELECT 'b', c_id, c_mode FROM {e_dc_b}""",
 }
 
 # The cases of edge_stages, run at every oasis_hw_filter_stage: one or two per stage of the hardware
-# filter and every hws_* case.
+# filter and every hws_* case but the hws_dc_* ones of edge_dict_cache.
 STAGE_CASES = ["hwf_mixed", "hwf_eq_first", "hwf_join_one_key_i32", "hwf_join_minmax", "hwf_join_ineq",
                "hwf_prf_i32", "hwf_prf_fold", "hwf_in_i32", "hwf_in_wide", "hwf_bf_i32",
-               "hwf_bf_i64"] + [c for c in CASES if c.startswith("hws_")]
+               "hwf_bf_i64"] + [c for c in CASES if c.startswith("hws_") and not c.startswith("hws_dc_")]
 STAGES = range(6)
 
 # The hardware filter messages of the log (duckdb_logs at DEBUG) and the first stage that may log them: no
@@ -392,6 +507,49 @@ STAGE_LOG_CHECKS = {
     "no_bitmap": ("message LIKE 'Hardware filter on column%bitmap%'", 3),
     "no_dict_ids": (DICT_IDS_MESSAGE, 4),
     "no_bloom": (BLOOM_MESSAGE, 5),
+}
+
+# The cases of edge_lossy: the stages each runs at, and whether the CPU checks the rows of the join filter
+# again after the hardware (the hardware passes a superset) and keeps a row group whose estimated share of
+# passing rows is above DuckDB's threshold of the filter on the CPU. Every case also has to be filtered in
+# hardware. The table holds its regions until the statement ends (oasis_filter_table_early_release off),
+# so the three bitmaps of hwf_lx_noregion do not all fit.
+# A case without the gate check may log the gate message too.
+LOSSY_CASES = {
+    "hwf_lx_fold": ([3, 5], True, False),
+    "hwf_lx_bloom": ([5], True, False),
+    "hwf_lx_noregion": ([3, 5], True, False),
+    "hwf_lx_exact": ([3, 5], False, False),
+    "hwf_lx_gate": ([3, 5], False, True),
+}
+LOSSY_HW_MESSAGE = "message LIKE 'Row group %: column%Filter(%'"
+LOSSY_RECHECK_MESSAGE = "message LIKE 'Row group %: column%the hardware passes a superset'"
+LOSSY_GATE_MESSAGE = "message LIKE 'Row group 1 on the CPU filter: the join bounds keep%'"
+
+# The cases of edge_table, run with oasis_filter_table_early_release off and on, and the lookup table
+# messages of the log: a region taken, the counters of a scan when it is done, the regions of a scan
+# returned early. A region of half the table is the folded Bloom filter of e_bloom_big.
+TABLE_CASES = [c for c in CASES if c.startswith("hwf_tb_")]
+TABLE_REGION_MESSAGE = "message LIKE 'Lookup table: region of%'"
+TABLE_HALF_MESSAGE = "message LIKE 'Lookup table: region of 8192 words%'"
+TABLE_SUMMARY_MESSAGE = "message LIKE 'Lookup table of the scan:%'"
+TABLE_RELEASE_MESSAGE = "message LIKE 'Lookup table: released%'"
+
+# The cases of edge_dict_cache, run with oasis_dict_cache off, off with oasis_prefetch_depth = 0 (the worker
+# waits for the dictionary pages of its head group itself) and on, and the dictionary messages of the log:
+# the pages a conjunct needs come before the row group is submitted, the others with the row group, and
+# only with the cache on do later scans take dictionaries from the cache.
+DICT_CACHE_CASES = [c for c in CASES if c.startswith("hws_dc_")]
+DICT_BEFORE_MESSAGE = "message LIKE 'Row group %dictionary page(s) fetched before the row group is submitted.'"
+DICT_WITH_MESSAGE = "message LIKE 'Row group %dictionary page(s) fetched with the row group.'"
+DICT_CACHED_MESSAGE = "message LIKE 'Row group %: the dictionary of column%is in the cache'"
+
+# The cases of edge_prof: the INTEGER column c_id without a filter, then with a filter that 1 % of the
+# rows pass. The post_filter_bytes of oasis_stream_profile() count from the start of the shell, so the
+# scenario reads the profile before and after each case.
+PROF_CASES = {
+    "hwf_prof_full": "SELECT c_id FROM {e_filter}",
+    "hwf_prof_filtered": "SELECT c_id FROM {e_filter} WHERE c_val < 10",
 }
 
 # Known gaps (extension/test/README.md, "Known gaps", and the codecs and encodings ParCore lacks).
@@ -423,7 +581,10 @@ def diff_sql(hw: str, sw: str) -> str:
 
 HEADER = "SET oasis_rdma_server = 'sim';\n"
 # The decoders saw input: the scan ran in the vFPGA, not only on the CPU. The bypass row has no in-side.
-FOOTER = ("SELECT coalesce(sum(in_handshakes_cycles), 0) > 0 AS hw_used FROM oasis_stream_profile();\n"
+# The decoders wrote to host memory (hw_bytes, the software count of the scheduler).
+FOOTER = ("SELECT coalesce(sum(in_handshakes_cycles), 0) > 0 AS hw_used,"
+          " coalesce(sum(post_filter_bytes) FILTER (WHERE in_handshakes_cycles IS NOT NULL), 0) > 0 AS hw_bytes"
+          " FROM oasis_stream_profile();\n"
           "SELECT 1 AS done;\n")
 
 
@@ -485,6 +646,120 @@ def stages_sql(cases: Dict[str, str], files: List[str]) -> Tuple[str, List[str]]
     return "".join(lines) + FOOTER, true_keys
 
 
+def table_sql(cases: Dict[str, str], files: List[str]) -> Tuple[str, List[str]]:
+    """The cases with the early release of the lookup table off and on, each with its log checks, and the
+    names of the result columns that must be true. Off, a statement holds at most two regions of half the
+    table and returns none early; on, the scans return theirs."""
+    hw = {f: hw_source(f) for f in files}
+    sw = {f: sw_source(f) for f in files}
+    lines = [HEADER, "SET enable_logging = true;\nSET logging_level = 'DEBUG';\nSET logging_storage = 'memory';\n"]
+    for name, query in cases.items():
+        lines.append(f"CREATE TEMP TABLE {name}_sw AS {query.format_map(sw)};\n")
+    true_keys = []
+    for release, tag in ((False, "off"), (True, "on")):
+        lines.append(f"SET oasis_filter_table_early_release = {str(release).lower()};\n")
+        for name, query in cases.items():
+            key = f"{name}_{tag}"
+            lines.append("CALL truncate_duckdb_logs();\n")
+            lines.append(f"CREATE TEMP TABLE {name}_hw_{tag} AS {query.format_map(hw)};\n")
+            lines.append(f"SELECT {diff_sql(f'{name}_hw_{tag}', name + '_sw')} = 0 AS same_{key};\n")
+            lines.append(f"SELECT count(*) > 0 AS regions_{key} FROM duckdb_logs WHERE {TABLE_REGION_MESSAGE};\n")
+            lines.append(f"SELECT count(*) > 0 AS summary_{key} FROM duckdb_logs WHERE {TABLE_SUMMARY_MESSAGE};\n")
+            true_keys += [f"same_{key}", f"regions_{key}", f"summary_{key}"]
+            if release:
+                lines.append(f"SELECT count(*) > 0 AS released_{key} FROM duckdb_logs WHERE {TABLE_RELEASE_MESSAGE};\n")
+                true_keys.append(f"released_{key}")
+            else:
+                lines.append(f"SELECT count(*) = 0 AS kept_{key} FROM duckdb_logs WHERE {TABLE_RELEASE_MESSAGE};\n")
+                lines.append(f"SELECT count(*) <= 2 AS full_{key} FROM duckdb_logs WHERE {TABLE_HALF_MESSAGE};\n")
+                true_keys += [f"kept_{key}", f"full_{key}"]
+    return "".join(lines) + FOOTER, true_keys
+
+
+def dict_cache_sql(cases: Dict[str, str], files: List[str]) -> Tuple[str, List[str]]:
+    """The cases with the dictionary cache off, off with a synchronous scan and on, each round with its log
+    checks, and the names of the result columns that must be true. Off, every page is fetched: before the
+    row group is submitted for a conjunct, else with it. On, the scans after the first of a file take the
+    dictionaries from the cache (which pages they fetch first depends on the order of the scans)."""
+    hw = {f: hw_source(f) for f in files}
+    sw = {f: sw_source(f) for f in files}
+    lines = [HEADER, "SET enable_logging = true;\nSET logging_level = 'DEBUG';\nSET logging_storage = 'memory';\n"]
+    for name, query in cases.items():
+        lines.append(f"CREATE TEMP TABLE {name}_sw AS {query.format_map(sw)};\n")
+    true_keys = []
+    for tag, cache, synchronous in (("off", False, False), ("sync", False, True), ("on", True, False)):
+        lines.append(f"SET oasis_dict_cache = {str(cache).lower()};\n")
+        lines.append("SET oasis_prefetch_depth = 0;\n" if synchronous else "RESET oasis_prefetch_depth;\n")
+        lines.append("CALL truncate_duckdb_logs();\n")
+        for name, query in cases.items():
+            key = f"{name}_{tag}"
+            lines.append(f"CREATE TEMP TABLE {name}_hw_{tag} AS {query.format_map(hw)};\n")
+            lines.append(f"SELECT {diff_sql(f'{name}_hw_{tag}', name + '_sw')} = 0 AS same_{key};\n")
+            true_keys.append(f"same_{key}")
+        if cache:
+            lines.append(f"SELECT count(*) > 0 AS cached_{tag} FROM duckdb_logs WHERE {DICT_CACHED_MESSAGE};\n")
+            true_keys.append(f"cached_{tag}")
+        else:
+            lines.append(f"SELECT count(*) > 0 AS before_{tag} FROM duckdb_logs WHERE {DICT_BEFORE_MESSAGE};\n")
+            lines.append(f"SELECT count(*) > 0 AS with_{tag} FROM duckdb_logs WHERE {DICT_WITH_MESSAGE};\n")
+            lines.append(f"SELECT count(*) = 0 AS uncached_{tag} FROM duckdb_logs WHERE {DICT_CACHED_MESSAGE};\n")
+            true_keys += [f"before_{tag}", f"with_{tag}", f"uncached_{tag}"]
+    return "".join(lines) + FOOTER, true_keys
+
+
+def lossy_sql(cases: Dict[str, str], files: List[str]) -> Tuple[str, List[str]]:
+    """The cases of LOSSY_CASES at their stages, each with its log checks, and the names of the result
+    columns that must be true."""
+    hw = {f: hw_source(f) for f in files}
+    sw = {f: sw_source(f) for f in files}
+    lines = [HEADER, "SET enable_logging = true;\nSET logging_level = 'DEBUG';\nSET logging_storage = 'memory';\n"]
+    for name, query in cases.items():
+        lines.append(f"CREATE TEMP TABLE {name}_sw AS {query.format_map(sw)};\n")
+    true_keys = []
+    for name, query in cases.items():
+        stages, recheck, gate = LOSSY_CASES[name]
+        for stage in stages:
+            key = f"{name}_s{stage}"
+            lines.append(f"SET oasis_hw_filter_stage = {stage};\nCALL truncate_duckdb_logs();\n")
+            lines.append(f"CREATE TEMP TABLE {name}_hw{stage} AS {query.format_map(hw)};\n")
+            lines.append(f"SELECT {diff_sql(f'{name}_hw{stage}', name + '_sw')} = 0 AS same_{key};\n")
+            lines.append(f"SELECT count(*) > 0 AS hw_{key} FROM duckdb_logs WHERE {LOSSY_HW_MESSAGE};\n")
+            lines.append(f"SELECT count(*) {'>' if recheck else '='} 0 AS recheck_{key} FROM duckdb_logs"
+                         f" WHERE {LOSSY_RECHECK_MESSAGE};\n")
+            true_keys += [f"same_{key}", f"hw_{key}", f"recheck_{key}"]
+            if gate:
+                lines.append(f"SELECT count(*) > 0 AS gate_{key} FROM duckdb_logs WHERE {LOSSY_GATE_MESSAGE};\n")
+                true_keys.append(f"gate_{key}")
+    lines.append(f"SET oasis_hw_filter_stage = {max(STAGES)};\n")
+    return "".join(lines) + FOOTER, true_keys
+
+
+def prof_sql(files: List[str]) -> str:
+    """The cases of PROF_CASES, each between two reads of oasis_stream_profile(), with the differing rows
+    and the bytes the decoders wrote of each case (<case>_bytes), and the checks of edge_prof."""
+    hw = {f: hw_source(f) for f in files}
+    sw = {f: sw_source(f) for f in files}
+    profile = ("SELECT stream, post_filter_bytes, no_buffer_ns, in_handshakes_cycles IS NOT NULL AS decoder"
+               " FROM oasis_stream_profile()")
+    lines = [HEADER, f"CREATE TEMP TABLE hwf_prof_p0 AS {profile};\n"]
+    for k, (name, query) in enumerate(PROF_CASES.items()):
+        lines.append(f"CREATE TEMP TABLE {name}_hw AS {query.format_map(hw)};\n")
+        lines.append(f"CREATE TEMP TABLE hwf_prof_p{k + 1} AS {profile};\n")
+    bytes_of = {}
+    for k, (name, query) in enumerate(PROF_CASES.items()):
+        bytes_of[name] = (f"(SELECT sum(b.post_filter_bytes - a.post_filter_bytes) FROM hwf_prof_p{k} a"
+                          f" JOIN hwf_prof_p{k + 1} b USING (stream) WHERE a.decoder)")
+        lines.append(f"CREATE TEMP TABLE {name}_sw AS {query.format_map(sw)};\n")
+        lines.append(f"SELECT {diff_sql(name + '_hw', name + '_sw')} AS diff_{name}, {bytes_of[name]} AS {name}_bytes;\n")
+    # 4 bytes per INTEGER value without a filter, under a tenth of that with the filter, and counters that
+    # never go back.
+    lines.append("SELECT 4 * count(*) AS hwf_prof_full_expect FROM hwf_prof_full_hw;\n")
+    lines.append(f"SELECT 10 * {bytes_of['hwf_prof_filtered']} < {bytes_of['hwf_prof_full']} AS hwf_prof_filtered_less;\n")
+    lines.append("SELECT bool_and(b.post_filter_bytes >= a.post_filter_bytes AND b.no_buffer_ns >= a.no_buffer_ns)"
+                 f" AS hwf_prof_monotonic FROM hwf_prof_p0 a JOIN hwf_prof_p{len(PROF_CASES)} b USING (stream);\n")
+    return "".join(lines) + FOOTER
+
+
 def write_scenario(out: Path, name: str, sql: str, files: List[str], checks: List[dict],
                    allow_errors: bool = False) -> str:
     (out / f"{name}.sql").write_text(sql)
@@ -518,6 +793,9 @@ def main() -> int:
         con.sql(f"CREATE TABLE {name} AS {query}")
         con.sql(f"COPY {name} TO '{data / name}.parquet' (FORMAT parquet{options})")
     write_pyarrow_files(data)
+    # Else hws_dc_files only checks the strings of two files, not the file in the keys of the cache
+    if not same_dictionary_pages(data, "e_dc_a", "e_dc_b", 1):
+        print("warning: the dictionary pages of e_dc_a and e_dc_b lie at different offsets", file=sys.stderr)
 
     # Pack the RDMA image
     parquet = sorted(data.glob("*.parquet"))
@@ -527,7 +805,7 @@ def main() -> int:
                    check=True, stdout=subprocess.DEVNULL)
 
     names = []
-    done = {"expect": {"hw_used": True, "done": 1}}
+    done = {"expect": {"hw_used": True, "hw_bytes": True, "done": 1}}
 
     # One per TPC-H query
     for nr, query in con.sql("SELECT query_nr, query FROM tpch_queries() ORDER BY query_nr").fetchall():
@@ -544,6 +822,33 @@ def main() -> int:
     sfiles = files_of(" ".join(stage_cases.values()))
     sql, true_keys = stages_sql(stage_cases, sfiles)
     names.append(write_scenario(out, "edge_stages", sql, sfiles, [{"expect": {k: True for k in true_keys}}, done]))
+
+    # The lookup table filled, with the early release of its regions off and on
+    table_cases = {c: CASES[c] for c in TABLE_CASES}
+    tfiles = files_of(" ".join(table_cases.values()))
+    sql, true_keys = table_sql(table_cases, tfiles)
+    names.append(write_scenario(out, "edge_table", sql, tfiles, [{"expect": {k: True for k in true_keys}}, done]))
+
+    # The dictionary pages of the dictionary id columns, with their cache off, off synchronously and on
+    dict_cache_cases = {c: CASES[c] for c in DICT_CACHE_CASES}
+    dfiles = files_of(" ".join(dict_cache_cases.values()))
+    sql, true_keys = dict_cache_sql(dict_cache_cases, dfiles)
+    names.append(write_scenario(out, "edge_dict_cache", sql, dfiles,
+                                [{"expect": {k: True for k in true_keys}}, done]))
+
+    # The lossy hardware forms of the join filters, with the CPU check after the hardware
+    lossy_cases = {c: CASES[c] for c in LOSSY_CASES}
+    lfiles = files_of(" ".join(lossy_cases.values()))
+    sql, true_keys = lossy_sql(lossy_cases, lfiles)
+    names.append(write_scenario(out, "edge_lossy", sql, lfiles, [{"expect": {k: True for k in true_keys}}, done]))
+
+    # The decoder bytes of the software counters of oasis_stream_profile()
+    pfiles = files_of(" ".join(PROF_CASES.values()))
+    names.append(write_scenario(out, "edge_prof", prof_sql(pfiles), pfiles,
+                                [{"equal": ["hwf_prof_full_bytes", "hwf_prof_full_expect"]},
+                                 {"expect": {"diff_hwf_prof_full": 0, "diff_hwf_prof_filtered": 0,
+                                             "hwf_prof_filtered_less": True, "hwf_prof_monotonic": True}},
+                                 done]))
 
     # One per gap
     for case, query in GAPS.items():

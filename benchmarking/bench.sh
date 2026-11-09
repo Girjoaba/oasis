@@ -26,7 +26,16 @@
 #   --stages LIST           ablation stages k of oasis_s<k> [tpch 1,2,3,4; clickbench 1,3,4]
 #                           (1 constants, 2 join bounds, 3 bitmaps, 4 dictionary ids; the Bloom filters (5)
 #                           are the mode oasis; ClickBench has no joins, so 2 = 1 and 5 = 4)
-#   --modes LIST            the main modes [native_rdma,oasis_nohw,oasis]
+#   --modes LIST            the main modes [native_rdma,oasis_nohw,oasis]; an oasis mode takes the
+#                           suffixes _narrow (oasis_narrow_transfer) and _pf<N> (oasis_prefetch_depth N),
+#                           in this order: oasis_nohw_narrow, oasis_pf4
+#   --narrow                adds the _narrow variant of every oasis mode, the ablation and smoke included
+#   --prefetch N            oasis_prefetch_depth of every cell [2]; not in the cell names: a run of its own
+#   --tp-profile            the DuckDB profile of every query of the throughput runs (scan metrics under
+#                           concurrent streams); not in the cell names: a run of its own
+#   --hw-log LIST           TPC-H queries for one latency pass per oasis mode with the hardware filter, under
+#                           DuckDB's log (cells <dataset>_<mode>_t<T>_log_r0, T the last latency thread
+#                           count; e.g. 4,5,8,17,18,21)
 #   --queries-tpch LIST     a subset of the queries, by number [all]
 #   --queries-clickbench LIST
 #   --sessions N            streams of a throughput run [4]
@@ -42,7 +51,7 @@ set -uo pipefail
 L=$BENCH_DIR/lib
 HOST=$(hostname -s)
 
-usage() { sed -n '2,37p' "$0"; exit "${1:-2}"; }
+usage() { sed -n '2,47p' "$0"; exit "${1:-2}"; }
 list() { echo "${1//,/ }"; }
 
 # --- prepare (build node) ----------------------------------------------------------------------------
@@ -90,7 +99,7 @@ prepare() {
 BITSTREAM=$BITSTREAM_DEFAULT SF=30 REPS=3 BENCHMARKS="tpch clickbench"
 EXPERIMENTS="throughput latency ablation" THREADS=8 LAT_THREADS="4 16" ABL_THREADS=8 STAGES=
 MODES="native_rdma oasis_nohw oasis" Q_TPCH= Q_CLICKBENCH= SESSIONS=4 STORE= RUN= SETUP=1 SMOKE=1
-MEM_LIMIT= TIMEOUT=3600 DRY=0 LOCAL_DIR=
+MEM_LIMIT= TIMEOUT=3600 DRY=0 LOCAL_DIR= NARROW=0 PREFETCH= HWLOG= TP_PROFILE=0
 
 parse_run() {
     while [ $# -gt 0 ]; do
@@ -106,6 +115,10 @@ parse_run() {
             --ablation-threads) ABL_THREADS=$2; shift ;;
             --stages) STAGES=$(list "$2"); shift ;;
             --modes) MODES=$(list "$2"); shift ;;
+            --narrow) NARROW=1 ;;
+            --prefetch) PREFETCH=$2; shift ;;
+            --hw-log) HWLOG=$2; shift ;;
+            --tp-profile) TP_PROFILE=1 ;;
             --queries-tpch) Q_TPCH=$2; shift ;;
             --queries-clickbench) Q_CLICKBENCH=$2; shift ;;
             --sessions) SESSIONS=$2; shift ;;
@@ -123,6 +136,7 @@ parse_run() {
         shift
     done
     RUN=${RUN:-$WORK/runs/$(date +%Y%m%d)_${HOST}_$BITSTREAM}
+    [ "$NARROW" = 1 ] && MODES=$(for m in $MODES; do echo "$m"; narrow_of "$m"; done | awk '!seen[$0]++' | tr '\n' ' ')
     if [ -z "$STORE" ]; then
         # hacc-u55c-05 -> hacc-u55c-06
         local num=${HOST##*[!0-9]} prefix=${HOST%"${HOST##*[!0-9]}"}
@@ -136,9 +150,28 @@ has() { case " $1 " in *" $2 "*) return 0 ;; *) return 1 ;; esac; }
 dataset_of() { [ "$1" = tpch ] && echo "tpch_sf$2" || echo "$1"; }
 stages_of() { [ -n "$STAGES" ] && echo "$STAGES" || { [ "$1" = tpch ] && echo "1 2 3 4" || echo "1 3 4"; }; }
 
+# The _narrow variant of an oasis mode, before its _pf<N> (oasis_pf4 -> oasis_narrow_pf4); nothing for
+# another mode or a narrow one
+narrow_of() {
+    local b=${1%%_pf*}
+    case "$1" in
+        *_narrow*|native*) ;;
+        oasis*) echo "${b}_narrow${1#"$b"}" ;;
+    esac
+}
+
+# The ablation modes of a benchmark: oasis_s<k>, with --narrow also oasis_s<k>_narrow
+abl_modes() {
+    local k
+    for k in $(stages_of "$1"); do
+        echo "oasis_s$k"
+        if [ "$NARROW" = 1 ]; then echo "oasis_s${k}_narrow"; fi
+    done
+}
+
 # The cells of the run in order, one per line: <folder> <bench> <dataset> <mode> <threads> <kind> <rep>.
 # Repetition by repetition, so a stopped run holds whole repetitions and a drift spreads over the modes;
-# the ablation after the main cells.
+# the log cells (--hw-log) and then the ablation after the main cells.
 cells() {
     local r b t m k
     for r in $(seq 0 $((REPS - 1))); do
@@ -151,13 +184,19 @@ cells() {
             fi
         done
     done
+    if [ -n "$HWLOG" ] && has "$BENCHMARKS" tpch; then
+        t=${LAT_THREADS##* }
+        for m in $MODES; do
+            case "$m" in oasis_nohw*|native*) ;; *) echo "$RUN tpch $(dataset_of tpch "$SF") $m ${t:-16} log 0" ;; esac
+        done
+    fi
     has "$EXPERIMENTS" ablation || return 0
     for r in $(seq 0 $((REPS - 1))); do
         for b in $BENCHMARKS; do
-            for k in $(stages_of "$b"); do echo "$RUN $b $(dataset_of "$b" "$SF") oasis_s$k $ABL_THREADS tp $r"; done
+            for m in $(abl_modes "$b"); do echo "$RUN $b $(dataset_of "$b" "$SF") $m $ABL_THREADS tp $r"; done
             if [ "$b" = tpch ]; then
                 for t in $LAT_THREADS; do
-                    for k in $(stages_of "$b"); do echo "$RUN $b $(dataset_of "$b" "$SF") oasis_s$k $t lat $r"; done
+                    for m in $(abl_modes "$b"); do echo "$RUN $b $(dataset_of "$b" "$SF") $m $t lat $r"; done
                 done
             fi
         done
@@ -169,7 +208,7 @@ smoke_cells() {
     for b in $BENCHMARKS; do
         local ds=tpch_sf1 kind=lat
         [ "$b" = clickbench ] && ds=clickbench_sample kind=tp
-        for m in $MODES $(for k in $(stages_of "$b"); do echo "oasis_s$k"; done); do
+        for m in $MODES $(abl_modes "$b"); do
             echo "$RUN/smoke $b $ds $m 8 $kind 0"
         done
     done
@@ -183,11 +222,14 @@ cell_name() { echo "${3}_${4}_t${5}_${6}_r${7}"; }
 estimate() {
     local name=$1 bench=$2 ds=$3 t=$5 kind=$6 key
     key=${name%_r*}
-    local prev
-    prev=$(cat "$WORK"/runs/*/index.tsv "$WORK"/runs/*/smoke/index.tsv 2> /dev/null |
-        awk -F'\t' -v k="$key" '{n = $1; sub(/_r[0-9]+$/, "", n)} n == k && $8 == 0 {print $9}' | sort -n |
-        awk '{a[NR] = $1} END {if (NR) print a[int((NR + 1) / 2)]}')
-    if [ -n "$prev" ]; then echo "$prev"; return; fi
+    local prev k
+    # a variant (_narrow, _pf<N>, a log cell) without an earlier run: the cell of its base mode
+    for k in "$key" "$(echo "$key" | sed -E 's/_narrow|_pf[0-9]+//g; s/_log$/_lat/')"; do
+        prev=$(cat "$WORK"/runs/*/index.tsv "$WORK"/runs/*/smoke/index.tsv 2> /dev/null |
+            awk -F'\t' -v k="$k" '{n = $1; sub(/_r[0-9]+$/, "", n)} n == k && $8 == 0 {print $9}' | sort -n |
+            awk '{a[NR] = $1} END {if (NR) print a[int((NR + 1) / 2)]}')
+        if [ -n "$prev" ]; then echo "$prev"; return; fi
+    done
     local scale=1
     case "$ds" in
         tpch_sf*) scale=$(awk -v s="${ds#tpch_sf}" 'BEGIN {print s / 30}') ;;
@@ -308,7 +350,9 @@ json.dump({"bitstream": "$BITSTREAM", "sf": "$SF", "reps": $REPS, "benchmarks": 
            "experiments": "$EXPERIMENTS".split(), "threads": ints("$THREADS"),
            "latency_threads": ints("$LAT_THREADS"), "ablation_threads": $ABL_THREADS, "modes": "$MODES".split(),
            "stages": {"tpch": ints("$st_tpch"), "clickbench": ints("$st_cb")}, "sessions": $SESSIONS,
-           "host": "$HOST", "store": "$STORE"}, open(sys.argv[1], "w"), indent=1)
+           "narrow": $NARROW == 1, "prefetch": ints("$PREFETCH")[0] if "$PREFETCH" else 2,
+           "hw_log": ints("${HWLOG//,/ }"), "tp_profile": $TP_PROFILE == 1, "host": "$HOST", "store": "$STORE"},
+          open(sys.argv[1], "w"), indent=1)
 EOF
     local ds
     for ds in $(datasets); do cp "$(dataset_dir "$ds")/loose.json" "$RUN/loose_$ds.json" 2> /dev/null || true; done
@@ -395,8 +439,13 @@ cell() {
     command -v numactl > /dev/null && pin=(numactl --physcpubind="0-$((t - 1))")
     local args=(--mode "$mode" --threads "$t" --sessions "$SESSIONS" --suite "$QUERIES/$bench" --seed $((42 + 100 * rep))
                 --memory-limit "$(cat "$RUN/memory_limit")" --out .)
-    [ "$kind" = tp ] && args+=(--tp-reps 1 --lat-reps 0) || args+=(--tp-reps 0 --lat-reps 1)
-    [ "$bench" = tpch ] && [ -n "$Q_TPCH" ] && args+=(--queries "$Q_TPCH")
+    case "$kind" in
+        tp) args+=(--tp-reps 1 --lat-reps 0); [ "$TP_PROFILE" = 1 ] && args+=(--tp-profile) ;;
+        lat) args+=(--tp-reps 0 --lat-reps 1) ;;
+        log) args+=(--tp-reps 0 --lat-reps 1 --hw-log --queries "$HWLOG") ;;
+    esac
+    [ -n "$PREFETCH" ] && args+=(--prefetch "$PREFETCH")
+    [ "$bench" = tpch ] && [ -n "$Q_TPCH" ] && [ "$kind" != log ] && args+=(--queries "$Q_TPCH")
     [ "$bench" = clickbench ] && [ -n "$Q_CLICKBENCH" ] && args+=(--queries "$Q_CLICKBENCH")
     [ "$mode" = native_local ] && args+=(--local-dir "$LOCAL_DIR/$ds") ||
         args+=(--server "$STORE_IP" --port "$(dataset_port "$ds")")
